@@ -500,6 +500,85 @@ describe("getModel direct routing (no gateway)", () => {
       expect(handle.model.baseUrl).toBe("http://my-ollama:11434/v1");
     }
   });
+
+  // A Vertex credential is a service-account key file; the project comes from it. Only the
+  // descriptor is asserted: pi's Vertex adapter rejects injected fetch (see HTTPS_ONLY_PROVIDERS
+  // in ai-gateway.ts), so request-level behavior is covered by google-vertex-auth.test.ts.
+  const VERTEX_KEY = JSON.stringify({
+    type: "service_account",
+    project_id: "my-project",
+    client_email: "vertex@my-project.iam.gserviceaccount.com",
+    private_key: "-----BEGIN PRIVATE KEY-----\nunused-here\n-----END PRIVATE KEY-----\n",
+    token_uri: "https://oauth2.googleapis.com/token",
+  });
+
+  it("builds a direct Google Vertex handle addressing the key's project in the default region",
+     () => {
+    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider: "google-vertex",
+      model: "gemini-2.5-flash",
+      apiToken: VERTEX_KEY,
+    }, INITIATOR);
+
+    expect(handle.model.api).toBe("google-vertex");
+    expect(handle.model.provider).toBe("google-vertex");
+    expect(handle.model.baseUrl).toBe(
+        "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1");
+    expect(handle.model.name).toBe("Gemini 2.5 Flash");
+    expect(handle.aiGatewayLogRoute).toBeUndefined();
+  });
+
+  it("scopes the Vertex endpoint to the configured region, with the global endpoint unprefixed",
+     () => {
+    const regional = getModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider: "google-vertex",
+      model: "gemini-2.5-flash",
+      apiToken: VERTEX_KEY,
+      location: "europe-west1",
+    }, INITIATOR);
+    expect(regional.model.baseUrl).toBe(
+        "https://europe-west1-aiplatform.googleapis.com/v1/projects/my-project/locations/europe-west1");
+
+    const global = getModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider: "google-vertex",
+      model: "gemini-2.5-flash",
+      apiToken: VERTEX_KEY,
+      location: "global",
+    }, INITIATOR);
+    expect(global.model.baseUrl).toBe(
+        "https://aiplatform.googleapis.com/v1/projects/my-project/locations/global");
+  });
+
+  it("lets a custom API URL replace the Vertex host but not the project path", () => {
+    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider: "google-vertex",
+      model: "gemini-2.5-flash",
+      apiToken: VERTEX_KEY,
+      apiUrl: "https://vertex-proxy.example.com",
+    }, INITIATOR);
+
+    expect(handle.model.baseUrl).toBe(
+        "https://vertex-proxy.example.com/v1/projects/my-project/locations/us-central1");
+  });
+
+  it("falls back to defaults for a Vertex model pi doesn't catalog", () => {
+    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider: "google-vertex",
+      model: "gemini-9.9-experimental",
+      apiToken: VERTEX_KEY,
+    }, INITIATOR);
+
+    expect(handle.model.name).toBe("gemini-9.9-experimental");
+    expect(handle.model.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+  });
+
+  it("rejects a Vertex config whose credential is not a service-account key", () => {
+    expect(() => getModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider: "google-vertex",
+      model: "gemini-2.5-flash",
+      apiToken: "AIza-not-a-key-file",
+    }, INITIATOR)).toThrow(/service-account JSON key/);
+  });
 });
 
 describe("PDF attachment bridging", () => {

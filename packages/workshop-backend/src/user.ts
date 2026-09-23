@@ -7,6 +7,7 @@ import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import { createWorkshopLogger } from "./observability";
 import { getAiGatewayConfig } from "./ai-gateway.js";
+import { parseServiceAccountKey } from "./google-vertex-auth.js";
 import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-billing/limits/config.js";
 import type { AdminSettings } from "./admin-settings.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./blueprint-archive.js";
@@ -552,6 +553,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (gwConfig && !gwConfig.providers.has(config.provider)) {
       throw new Error(`Provider "${config.provider}" is not available in AI Gateway mode.`);
     }
+    // A Vertex credential is a service-account key file; reject a bad paste now rather than at
+    // the first chat message.
+    if (config.provider === "google-vertex") parseServiceAccountKey(config.apiToken);
 
     profile.type = "agent";
     this.storage.aiModels.put({profile, config});
