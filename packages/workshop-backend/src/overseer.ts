@@ -43,6 +43,8 @@ import type { ChatGatewayRpcTarget, SubmitExternalMessageResult } from "@gadgets
 import type { GadgetExportFormat } from "@gadgets/workshop-shared/api";
 import {
   assertChatAttachmentSupportedByProvider,
+  chatAttachmentNeedsConversion,
+  convertChatAttachmentToMarkdown,
   isAllowedChatAttachmentImageMimeType,
   validateChatAttachmentUpload,
 } from "./chat-attachment-validation";
@@ -3016,6 +3018,17 @@ class OverseerImpl implements AgentHooks {
       ai: this.env.WORKERS_AI,
       gateway: getAiGatewayConfig(this.env),
     };
+  }
+
+  // Converts a document upload the chat's model can't read natively to a Markdown attachment. No
+  // prohibitAllSharing check, unlike getWebFetchEnv(): the bytes come from the user and go only to
+  // the deployment's own Workers AI binding, not to a public site.
+  convertChatAttachment(attachment: ChatAttachmentUpload): Promise<ChatAttachmentUpload> {
+    let gatewayId = getAiGatewayConfig(this.env)?.sameAccountGateway;
+    return convertChatAttachmentToMarkdown(
+        this.env.WORKERS_AI,
+        gatewayId ? {id: gatewayId, metadata: {tool: "chatAttachment"}} : undefined,
+        attachment);
   }
 
   // Record an observation that originated from a built-in agent tool (not a gatekeeper).
@@ -8241,6 +8254,9 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     let provider: AiModelConfig["provider"] | undefined;
     if (modelId !== null) {
       provider = (await this.#clientUser.getChatContext(modelId)).aiModel?.config.provider;
+    }
+    if (chatAttachmentNeedsConversion(provider, attachment.mimeType, attachment.name)) {
+      attachment = await this.impl.convertChatAttachment(attachment);
     }
     attachment = validateChatAttachmentUpload(
       attachment,

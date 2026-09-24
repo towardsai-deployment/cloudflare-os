@@ -18,6 +18,7 @@
 // permit fetching from any address (so localhost services stay reachable), so the flag
 // only takes effect in production -- an acceptable tradeoff for dev.
 
+import { CONVERTIBLE_DOCUMENTS, convertDocumentToMarkdown } from "@gadgets/backend-utils/document-markdown";
 import type { AiGatewayConfig } from "./ai-gateway";
 
 /**
@@ -153,8 +154,7 @@ function baseContentType(contentType: string): string {
 }
 
 // MIME types that `env.WORKERS_AI.toMarkdown()` can convert for free (no Workers AI model
-// usage). Derived from the public list of supported formats:
-// https://developers.cloudflare.com/workers-ai/features/markdown-conversion/supported-formats/
+// usage): the shared binary document formats plus the markup ones only webFetch converts.
 //
 // Image MIME types are intentionally excluded -- image conversion uses paid Workers AI
 // models (object detection + Gemma-3 for image-to-text), and we don't want webFetch to
@@ -162,19 +162,10 @@ function baseContentType(contentType: string): string {
 const TO_MARKDOWN_MIME_TYPES = new Set([
   "text/html",
   "application/xhtml+xml",
-  "application/pdf",
   "application/xml",
   "text/xml",
   "text/csv",
-  // Office / OpenDocument
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document", // .docx
-  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",       // .xlsx
-  "application/vnd.ms-excel",                                                // .xls
-  "application/vnd.ms-excel.sheet.macroenabled.12",                          // .xlsm
-  "application/vnd.ms-excel.sheet.binary.macroenabled.12",                   // .xlsb
-  "application/vnd.oasis.opendocument.spreadsheet",                          // .ods
-  "application/vnd.oasis.opendocument.text",                                 // .odt
-  "application/vnd.apple.numbers",                                           // .numbers
+  ...CONVERTIBLE_DOCUMENTS.map(format => format.mimeType),
 ]);
 
 // `toMarkdown()` uses the Workers AI binding, and binding calls only reach gateways in the
@@ -205,30 +196,21 @@ async function convertToMarkdown(
   // Build a name from the URL path so toMarkdown's format detection has a hint.
   const pathBasename = url.pathname.split("/").filter(Boolean).pop() || "document";
 
-  const result = await env.ai.toMarkdown(
-    {
-      name: pathBasename,
-      blob: new Blob([bytes], { type: mime }),
-    },
-    {
-      gateway: buildGatewayOptions(env.gateway),
-      conversionOptions: {
-        // Resolve relative links against the page's own origin.
-        html: {
-          hostname: url.origin,
-          // Skip per-image summarization (which would invoke paid Workers AI models). The
-          // agent gets a Markdown skeleton with image alt text and src URLs, which is
-          // sufficient for documentation-lookup use cases.
-          images: { convert: false, convertOGImage: false },
-        },
+  return convertDocumentToMarkdown(env.ai, { name: pathBasename, bytes, mimeType: mime }, {
+    gateway: buildGatewayOptions(env.gateway),
+    // A short page is a legitimate fetch result, unlike a near-empty upload.
+    requireText: false,
+    conversionOptions: {
+      // Resolve relative links against the page's own origin.
+      html: {
+        hostname: url.origin,
+        // Skip per-image summarization (which would invoke paid Workers AI models). The
+        // agent gets a Markdown skeleton with image alt text and src URLs, which is
+        // sufficient for documentation-lookup use cases.
+        images: { convert: false, convertOGImage: false },
       },
     },
-  );
-
-  if (result.format === "error") {
-    throw new Error(`Markdown conversion failed: ${result.error}`);
-  }
-  return result.data;
+  });
 }
 
 

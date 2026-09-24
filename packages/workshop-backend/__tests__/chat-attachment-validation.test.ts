@@ -1,7 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   assertChatAttachmentSupportedByProvider,
+  chatAttachmentNeedsConversion,
+  convertChatAttachmentToMarkdown,
   isAllowedChatAttachmentImageMimeType,
+  MAX_CONVERTIBLE_CHAT_ATTACHMENT_BYTES,
   validateChatAttachmentUpload,
 } from "../src/chat-attachment-validation.js";
 
@@ -29,6 +32,8 @@ describe("assertChatAttachmentSupportedByProvider", () => {
       .not.toThrow();
     expect(() => assertChatAttachmentSupportedByProvider("google", "application/zip", 1))
       .toThrow("Unsupported file type");
+    // Still true of the validator itself: uploads for such providers are converted to Markdown
+    // before validation (see chatAttachmentNeedsConversion), so a raw PDF never reaches it.
     expect(() => assertChatAttachmentSupportedByProvider("cloudflare", "application/pdf", 1))
       .toThrow("Unsupported file type");
     expect(() => assertChatAttachmentSupportedByProvider("ollama", "application/zip", 1))
@@ -38,6 +43,83 @@ describe("assertChatAttachmentSupportedByProvider", () => {
   it("enforces the per-file byte limit", () => {
     expect(() => assertChatAttachmentSupportedByProvider(undefined, "text/plain", 1024 * 1024 + 1))
       .toThrow("Chat attachment is too large.");
+  });
+
+  it("tells PowerPoint uploads to export as PDF", () => {
+    expect(() => assertChatAttachmentSupportedByProvider(
+      "cloudflare", "application/vnd.openxmlformats-officedocument.presentationml.presentation", 1,
+      "deck.pptx")).toThrow("PowerPoint files (.pptx) can't be converted. Export it as PDF and upload that.");
+  });
+});
+
+describe("chatAttachmentNeedsConversion", () => {
+  it("converts documents for providers without native document input", () => {
+    for (const provider of ["cloudflare", "gateway-openai", "ollama", undefined] as const) {
+      expect(chatAttachmentNeedsConversion(provider, "application/pdf", "report.pdf")).toBe(true);
+    }
+    // Office formats are converted even for PDF-capable providers.
+    expect(chatAttachmentNeedsConversion("anthropic",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "memo.docx")).toBe(true);
+    // An empty or generic MIME type falls back to the extension.
+    expect(chatAttachmentNeedsConversion("cloudflare", "", "report.pdf")).toBe(true);
+  });
+
+  it("keeps native PDF input for providers that have it", () => {
+    for (const provider of ["anthropic", "openai", "google"] as const) {
+      expect(chatAttachmentNeedsConversion(provider, "application/pdf", "report.pdf")).toBe(false);
+    }
+  });
+
+  it("leaves text and images alone", () => {
+    expect(chatAttachmentNeedsConversion("cloudflare", "text/plain", "notes.txt")).toBe(false);
+    expect(chatAttachmentNeedsConversion("cloudflare", "text/html", "page.html")).toBe(false);
+    expect(chatAttachmentNeedsConversion("gateway-openai", "image/png", "photo.png")).toBe(false);
+  });
+});
+
+describe("convertChatAttachmentToMarkdown", () => {
+  const pdf = { mimeType: "application/pdf", content: new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d]), name: "report.pdf" };
+
+  function aiReturning(data: string) {
+    const toMarkdown = vi.fn(async (doc: { name: string; blob: Blob }) => ({
+      id: "x", name: doc.name, mimeType: doc.blob.type, format: "markdown" as const, tokens: 1, data,
+    }));
+    return { ai: { toMarkdown } as unknown as Ai, toMarkdown };
+  }
+
+  it("stores the Markdown as <name>.md, which then validates for text-only providers", async () => {
+    const text = "# report.pdf\n\nRevenue grew twelve percent in the third quarter of the year.";
+    const { ai, toMarkdown } = aiReturning(text);
+    const gateway = { id: "gw", metadata: { tool: "chatAttachment" } };
+
+    const converted = await convertChatAttachmentToMarkdown(ai, gateway, pdf);
+
+    expect(converted.mimeType).toBe("text/markdown");
+    expect(converted.name).toBe("report.pdf.md");
+    expect(new TextDecoder().decode(converted.content)).toBe(text);
+    expect(toMarkdown.mock.calls[0][1]).toMatchObject({ gateway });
+    expect(() => validateChatAttachmentUpload(converted, "gateway-openai")).not.toThrow();
+  });
+
+  it("rejects documents over the raw cap before converting", async () => {
+    const { ai, toMarkdown } = aiReturning("unused");
+    const big = { ...pdf, content: new Uint8Array(MAX_CONVERTIBLE_CHAT_ATTACHMENT_BYTES + 1200 * 1024) };
+
+    await expect(convertChatAttachmentToMarkdown(ai, undefined, big))
+      .rejects.toThrow("report.pdf is 11.2 MB; documents must be 10 MB or smaller.");
+    expect(toMarkdown).not.toHaveBeenCalled();
+  });
+
+  it("rejects converted text over the 256 KB chat cap", async () => {
+    const { ai } = aiReturning("x".repeat(300 * 1024));
+
+    await expect(convertChatAttachmentToMarkdown(ai, undefined, pdf)).rejects.toThrow(
+      "report.pdf converts to 300 KB of text; the limit is 256 KB. Split it or upload only the pages you need.");
+  });
+
+  it("surfaces the converter's message when nothing is bound", async () => {
+    await expect(convertChatAttachmentToMarkdown(undefined, undefined, pdf))
+      .rejects.toThrow("Document conversion isn't available on this deployment");
   });
 });
 

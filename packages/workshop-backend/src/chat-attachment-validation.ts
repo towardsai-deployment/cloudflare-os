@@ -1,9 +1,21 @@
 import { isTextLikeAttachmentMimeType } from "@gadgets/workshop-shared/api";
 import type { AiModelConfig, AiModelProvider, ChatAttachmentUpload } from "@gadgets/workshop-shared/api";
+import {
+  convertDocumentToMarkdown, convertibleDocumentFormat, documentMimeType, formatByteSize,
+  unsupportedFileTypeMessage,
+} from "@gadgets/backend-utils/document-markdown";
 import { PDF_MIME_TYPE } from "./chat-attachment-pdf";
 
 // Bounds attachment storage and the bytes replayed into model requests.
 const MAX_CHAT_ATTACHMENT_BYTES = 1024 * 1024;
+
+/** Raw size cap for a document that is converted to Markdown at upload; only its text is stored. */
+export const MAX_CONVERTIBLE_CHAT_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+
+// A converted document's text is replayed into every turn like any text attachment, and conversion
+// makes large ones common, so it is capped well below MAX_CHAT_ATTACHMENT_BYTES: 256 KB is roughly
+// 64k tokens, a quarter of the deployed models' context window.
+const MAX_CONVERTED_CHAT_ATTACHMENT_BYTES = 256 * 1024;
 
 const IMAGE_SIGNATURES = new Map<string, readonly (number | null)[]>([
   ["image/jpeg", [0xFF, 0xD8, 0xFF]],
@@ -58,19 +70,58 @@ export function assertChatAttachmentSupportedByProvider(
   provider: AiModelProvider | undefined,
   mimeType: string,
   byteLength: number,
+  name?: string,
 ): void {
   if (byteLength > MAX_CHAT_ATTACHMENT_BYTES) {
     throw new Error("Chat attachment is too large.");
   }
 
-  if (!provider) {
-    if (isTextOrImageMime(mimeType)) return;
-    throw new Error("Unsupported file type");
+  if (provider ? ATTACHMENT_SUPPORT_BY_PROVIDER[provider](mimeType) : isTextOrImageMime(mimeType)) return;
+
+  throw new Error(unsupportedFileTypeMessage(mimeType, name));
+}
+
+/**
+ * Whether an upload is a convertible document (PDF, Office, ...) that the provider can't take
+ * natively, so it is stored as its Markdown text instead (see convertChatAttachmentToMarkdown).
+ * With no model selected no provider is known to take documents, so they are always converted.
+ */
+export function chatAttachmentNeedsConversion(
+  provider: AiModelProvider | undefined,
+  mimeType: string | undefined,
+  name?: string,
+): boolean {
+  let documentType = documentMimeType(sanitizeChatAttachmentMimeType(mimeType), name);
+  if (!convertibleDocumentFormat(documentType)) return false;
+  return !provider || !ATTACHMENT_SUPPORT_BY_PROVIDER[provider](documentType);
+}
+
+/**
+ * Replace a document upload with its Markdown text, as `<name>.md` of type text/markdown, which
+ * every provider accepts and replay inlines like any text file. Throws a user-readable error when
+ * the document is too large, can't be converted, or converts to more text than a chat may carry.
+ */
+export async function convertChatAttachmentToMarkdown(
+  ai: Ai | undefined,
+  gateway: GatewayOptions | undefined,
+  attachment: ChatAttachmentUpload,
+): Promise<ChatAttachmentUpload> {
+  let name = sanitizeChatAttachmentName(attachment.name) ?? "document";
+  if (attachment.content.byteLength > MAX_CONVERTIBLE_CHAT_ATTACHMENT_BYTES) {
+    throw new Error(
+        `${name} is ${formatByteSize(attachment.content.byteLength)}; documents must be ` +
+        `${formatByteSize(MAX_CONVERTIBLE_CHAT_ATTACHMENT_BYTES)} or smaller.`);
   }
-
-  if (ATTACHMENT_SUPPORT_BY_PROVIDER[provider](mimeType)) return;
-
-  throw new Error("Unsupported file type");
+  let mimeType = documentMimeType(sanitizeChatAttachmentMimeType(attachment.mimeType), name);
+  let markdown = await convertDocumentToMarkdown(ai, {name, bytes: attachment.content, mimeType}, {gateway});
+  let content = new TextEncoder().encode(markdown);
+  if (content.byteLength > MAX_CONVERTED_CHAT_ATTACHMENT_BYTES) {
+    throw new Error(
+        `${name} converts to ${formatByteSize(content.byteLength)} of text; the limit is ` +
+        `${formatByteSize(MAX_CONVERTED_CHAT_ATTACHMENT_BYTES)}. Split it or upload only the pages you need.`);
+  }
+  // Leave room for the suffix within the 255-character name limit.
+  return {mimeType: "text/markdown", name: `${name.slice(0, 252)}.md`, content};
 }
 
 /** Normalize and validate attachment bytes before staging them in chat storage. */
@@ -80,7 +131,8 @@ export function validateChatAttachmentUpload(
 ): ChatAttachmentUpload {
   attachment.name = sanitizeChatAttachmentName(attachment.name);
   attachment.mimeType = sanitizeChatAttachmentMimeType(attachment.mimeType);
-  assertChatAttachmentSupportedByProvider(provider, attachment.mimeType, attachment.content.byteLength);
+  assertChatAttachmentSupportedByProvider(
+    provider, attachment.mimeType, attachment.content.byteLength, attachment.name);
 
   let signature = CONTENT_SIGNATURES.get(attachment.mimeType);
   if (signature) {

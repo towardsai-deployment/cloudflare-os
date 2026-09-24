@@ -184,6 +184,8 @@ describe("webFetch document conversion", () => {
     const result = await webFetch(env, { url: "https://example.com/doc.pdf" });
     expect(toMarkdown).toHaveBeenCalledTimes(1);
     expect(toMarkdown.mock.calls[0][0].blob.type).toBe("application/pdf");
+    // Embedded-image conversion runs paid models, so it is never requested.
+    expect(toMarkdown.mock.calls[0][1].conversionOptions.pdf.images.convert).toBe(false);
     expect(result.body).toBe("PDF text content");
   });
 
