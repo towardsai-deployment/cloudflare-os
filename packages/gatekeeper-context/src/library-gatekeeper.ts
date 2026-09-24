@@ -109,7 +109,8 @@ interface ContextDocument {
   title: string;
   path?: string;
   description?: string;
-  content: string;        // text (markdown/etc.) or a data: URI for binary content
+  content: string;        // text (markdown/etc.; PDFs and Office documents arrive converted to
+                          // markdown) or a data: URI for other binary content such as images
 }
 `;
 
@@ -274,7 +275,8 @@ export class ContextGatekeeper
       return new LibraryReadSession(
         this.#collections(), this.#userLibraries(),
         this.ctx.props.sharingDomain, this.ctx.props.accountId, ownedAuthorizer,
-        collectionIds => this.#observers().prepareObservation(collectionIds));
+        collectionIds => this.#observers().prepareObservation(collectionIds),
+        this.env.WORKERS_AI);
     } catch (err) {
       ownedAuthorizer[Symbol.dispose]?.();
       throw err;

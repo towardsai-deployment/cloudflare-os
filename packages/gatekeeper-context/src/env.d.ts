@@ -6,6 +6,10 @@ declare namespace Cloudflare {
     CONTEXT_COLLECTIONS: KVNamespace;
     // Optional Git-compatible backing repos for artifact-backed context collections.
     ARTIFACTS?: Artifacts;
+    // Optional Workers AI binding for converting uploaded documents (PDF, Office) to Markdown.
+    // Deploy tooling injects it; without it, document import and read-time conversion report
+    // that conversion isn't available.
+    WORKERS_AI?: Ai;
   }
 
   interface GlobalProps {

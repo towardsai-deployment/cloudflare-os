@@ -15,6 +15,7 @@ import {
   listPublicCollectionsFromKv, metadataToSummary,
 } from "./collection-kv.js";
 import { domainName } from "./domain.js";
+import { convertUploadedDocument } from "./document-conversion.js";
 
 /** Collections visible to this account's agents. */
 export async function loadEnabledContextCollections(
@@ -243,6 +244,19 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
   }): Promise<void> {
     await this.#assertCanWrite(collectionId);
     await this.#collection(collectionId).putContextDocument(path, doc);
+  }
+
+  async importContextDocument(collectionId: string, path: string, doc: {
+    base64: string; description?: string;
+  }): Promise<{ path: string }> {
+    await this.#assertCanWrite(collectionId);
+    let converted = await convertUploadedDocument(this.env.WORKERS_AI, path, doc.base64);
+    await this.#collection(collectionId).putContextDocument(converted.path, {
+      description: doc.description || `Converted from ${path.slice(path.lastIndexOf("/") + 1)}`,
+      body: converted.markdown,
+      contentType: "text/markdown",
+    });
+    return { path: converted.path };
   }
 
   async deleteContextDocument(collectionId: string, path: string): Promise<void> {

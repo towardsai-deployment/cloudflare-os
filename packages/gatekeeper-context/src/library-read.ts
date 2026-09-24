@@ -14,6 +14,7 @@ import {
 import type { ContextCollectionDurableObject } from "./context-collection.js";
 import type { UserLibraryDurableObject } from "./user-library.js";
 import { domainName } from "./domain.js";
+import { readBinaryDocumentContent } from "./document-conversion.js";
 import { obsContext } from "./observability.js";
 
 const logger = obsContext.createLogger({
@@ -42,6 +43,8 @@ export class LibraryReadSession extends RpcTarget {
     private accountId: string,
     private authorizer: NativeRpcStub<ObservationAuthorizer>,
     private observeCollections: ObserveCollections,
+    // Converts stored PDFs and Office documents to Markdown on read; absent without the binding.
+    private ai?: Ai,
   ) {
     super();
   }
@@ -172,7 +175,7 @@ export class LibraryReadSession extends RpcTarget {
 
     let content = isTextContentType(doc.contentType)
       ? doc.body
-      : `data:${doc.contentType};base64,${doc.body}`;
+      : await readBinaryDocumentContent(this.ai, doc);
     return {
       docId,
       title: doc.name,

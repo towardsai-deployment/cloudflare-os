@@ -2,6 +2,9 @@
 // getTypeScriptTypes().
 
 import type { RpcTarget } from "capnweb";
+import {
+  fileExtension, isConvertibleDocumentName, UNSUPPORTED_DOCUMENT_HINTS,
+} from "@gadgets/backend-utils/document-formats";
 
 /** Vendor id = GATEKEEPER_<NAME> binding suffix (lowercased). */
 export const VENDOR_ID = "context";
@@ -58,7 +61,11 @@ export type ContextListing = {
   entries: ContextListingEntry[];
 };
 
-/** Full document returned by read(); binary content is a data: URI. */
+/**
+ * Full document returned by read(). Text is literal. A stored PDF or Office document is converted
+ * to Markdown on read (or replaced by a short note when that fails); other binary content, such as
+ * images, is a data: URI.
+ */
 export type ContextReadResult = {
   docId: string;
   title: string;
@@ -211,6 +218,36 @@ export const DEFAULT_DOCUMENT_CONTENT_TYPE = "text/markdown";
 /** UTF-8 bytes of stored body; base64 overhead caps raw binary around 1 MB. */
 export const MAX_DOCUMENT_BODY_BYTES = 1_400_000;
 
+/** Raw size cap for a document converted to Markdown on upload (see importContextDocument). */
+export const MAX_CONVERTIBLE_UPLOAD_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Cap on converted Markdown, in UTF-16 code units, on top of MAX_DOCUMENT_BODY_BYTES. Durable
+ * Object storage serialises strings as UTF-16 against a 2 MB row limit, which the UTF-8 byte check
+ * alone doesn't bound for non-Latin-1 text; 900,000 code units stays under it for any text.
+ */
+export const MAX_CONVERTED_MARKDOWN_CHARS = 900_000;
+
+/**
+ * Extensions of binary files that are neither convertible nor otherwise stored, rejected on upload
+ * instead of being saved as garbled Markdown (unknown extensions default to text/markdown).
+ */
+export const UNSUPPORTED_BINARY_EXTENSIONS: ReadonlySet<string> = new Set([
+  ...UNSUPPORTED_DOCUMENT_HINTS.keys(),
+  "zip", "gz", "tgz", "tar", "7z", "rar", "exe", "dll", "dmg", "iso",
+  "mp3", "mp4", "m4a", "mov", "wav", "avi", "heic", "tif", "tiff",
+]);
+
+/** Whether a path names a document (PDF, Office, ...) that is converted to Markdown on upload. */
+export function isConvertibleDocumentPath(path: string): boolean {
+  return isConvertibleDocumentName(path);
+}
+
+/** Whether a path's extension is one of UNSUPPORTED_BINARY_EXTENSIONS. */
+export function isUnsupportedBinaryPath(path: string): boolean {
+  return UNSUPPORTED_BINARY_EXTENSIONS.has(fileExtension(path));
+}
+
 // Map of file extensions (without the dot, lowercased) to MIME types we recognize.
 //
 // Active types are only returned over RPC, never served from an HTTP origin. Sanitize if that changes.
@@ -331,6 +368,16 @@ export interface ContextApi extends RpcTarget {
   putContextDocument(collectionId: string, path: string, doc: {
     description: string; body: string; contentType?: string;
   }): Promise<void>;
+  /**
+   * Upload a convertible document (see isConvertibleDocumentPath) as Markdown: the base64 body is
+   * converted with Workers AI and stored as text/markdown at `<path>.md`; the original is not kept.
+   * Separate from putContextDocument so that editing a stored binary never re-converts it. Throws
+   * a user-readable error for unsupported types, oversized input or output, and scanned PDFs.
+   * Returns the stored path. The description defaults to "Converted from <file name>".
+   */
+  importContextDocument(collectionId: string, path: string, doc: {
+    base64: string; description?: string;
+  }): Promise<{ path: string }>;
   deleteContextDocument(collectionId: string, path: string): Promise<void>;
   moveContextDocument(collectionId: string, fromPath: string, toPath: string): Promise<void>;
   /** Own private collections plus every public one. */
