@@ -83,6 +83,7 @@ import {
   MessageFormatRef,
   OutputIcon,
   OutputFormatOffer,
+  SUGGESTED_MODELS,
 } from "@gadgets/workshop-shared/api";
 import { ActionKind, ResourceDescription } from "@gadgets/workshop-shared/gatekeeper";
 import {
@@ -385,6 +386,8 @@ type PendingAttachment = {
   uploadState: "uploading" | "ready" | "error";
   ref?: ChatAttachmentHandle;
   error?: string;
+  /** Converted to Markdown by the server, so its raw size doesn't count toward the pending total. */
+  converted: boolean;
 };
 
 const MAX_PENDING_ATTACHMENTS = 5;
@@ -409,10 +412,36 @@ const CONVERTIBLE_DOCUMENT_MIME_TYPES = new Set([
   "application/vnd.apple.numbers",
 ]);
 
-function isConvertibleDocument(name: string | undefined, mimeType: string): boolean {
-  if (CONVERTIBLE_DOCUMENT_MIME_TYPES.has(mimeType.toLowerCase())) return true;
-  const dot = name?.lastIndexOf(".") ?? -1;
-  return dot > 0 && CONVERTIBLE_DOCUMENT_EXTENSIONS.has(name!.slice(dot + 1).toLowerCase());
+// Providers whose models read PDFs natively, so the server stores a PDF for them as-is (under the
+// 1 MB cap) instead of converting it.
+const PDF_NATIVE_PROVIDERS = ["anthropic", "openai", "google"] as const;
+// Mirrors EXPECTED_DOCUMENT_ERROR_KINDS in @gadgets/backend-utils/document-markdown: the server tags
+// user errors with an own `kind` property, which survives RPC, and those aren't reported as issues.
+const EXPECTED_UPLOAD_ERROR_KINDS = new Set(["no-text", "too-large", "unsupported"]);
+
+/**
+ * Whether the server will convert this upload to Markdown for the selected model, mirroring the
+ * backend's documentMimeType and chatAttachmentNeedsConversion: a specific MIME type wins over the
+ * extension, Office formats are always converted, and a PDF is kept raw only for a model the
+ * picker knows to be PDF-native. An unknown model (a custom one, or none) is assumed to need
+ * conversion; if it doesn't, the server's 1 MB check still rejects an oversized PDF.
+ */
+export function chatAttachmentWillBeConverted(
+  modelId: string | null, name: string | undefined, mimeType: string,
+): boolean {
+  const mime = mimeType.split(";", 1)[0].trim().toLowerCase();
+  let isPdf: boolean;
+  if (mime && mime !== "application/octet-stream") {
+    if (!CONVERTIBLE_DOCUMENT_MIME_TYPES.has(mime)) return false;
+    isPdf = mime === "application/pdf";
+  } else {
+    const dot = name?.lastIndexOf(".") ?? -1;
+    const ext = dot > 0 ? name!.slice(dot + 1).toLowerCase() : "";
+    if (!CONVERTIBLE_DOCUMENT_EXTENSIONS.has(ext)) return false;
+    isPdf = ext === "pdf";
+  }
+  if (!isPdf || modelId === null) return true;
+  return !PDF_NATIVE_PROVIDERS.some((provider) => modelId in SUGGESTED_MODELS[provider]);
 }
 
 function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number): Promise<Blob> {
@@ -421,9 +450,9 @@ function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number)
   });
 }
 
-async function prepareChatAttachment(file: File): Promise<{blob: Blob, mimeType: string}> {
+async function prepareChatAttachment(file: File, modelId: string | null): Promise<{blob: Blob, mimeType: string}> {
   if (!file.type.startsWith("image/")) {
-    if (isConvertibleDocument(file.name, file.type)) {
+    if (chatAttachmentWillBeConverted(modelId, file.name, file.type)) {
       if (file.size > MAX_CHAT_DOCUMENT_BYTES) {
         throw new Error(`${file.name} is ${formatAttachmentSize(file.size)}; documents must be ${formatAttachmentSize(MAX_CHAT_DOCUMENT_BYTES)} or smaller.`);
       }
@@ -2255,7 +2284,7 @@ export const ChatInput = ({
     } catch (err: any) {
       console.error("Failed to upload chat attachment:", err);
       if (!mountedRef.current) return;
-      reportIssue('chat.attachment-upload', err)
+      if (!EXPECTED_UPLOAD_ERROR_KINDS.has(err?.kind)) reportIssue('chat.attachment-upload', err)
       setPendingAttachments((prev) => prev.map((attachment) => attachment.id === id ? {
         ...attachment,
         uploadState: "error",
@@ -2283,7 +2312,7 @@ export const ChatInput = ({
 
     const prepared = await Promise.allSettled(accepted.map(async (file) => ({
       file,
-      ...(await prepareChatAttachment(file)),
+      ...(await prepareChatAttachment(file, selectedModel)),
     })));
     if (!mountedRef.current) return;
 
@@ -2302,8 +2331,9 @@ export const ChatInput = ({
       // Documents are capped one by one instead: only their converted text is stored, and the
       // server's total check counts stored bytes.
       const totalPendingBytes = pendingAttachmentsRef.current.reduce((sum, attachment) =>
-        isConvertibleDocument(attachment.name, attachment.mimeType) ? sum : sum + attachment.blob.size, 0);
-      if (!isConvertibleDocument(file.name, mimeType) && totalPendingBytes + blob.size > MAX_CHAT_ATTACHMENT_TOTAL_BYTES) {
+        attachment.converted ? sum : sum + attachment.blob.size, 0);
+      const converted = chatAttachmentWillBeConverted(selectedModel, file.name, mimeType);
+      if (!converted && totalPendingBytes + blob.size > MAX_CHAT_ATTACHMENT_TOTAL_BYTES) {
         toasts.add({ title: `Attached files must total ${formatAttachmentSize(MAX_CHAT_ATTACHMENT_TOTAL_BYTES)} or less`, variant: "error" });
         continue;
       }
@@ -2316,6 +2346,7 @@ export const ChatInput = ({
         name: file.name || undefined,
         previewUrl,
         uploadState: "uploading",
+        converted,
       };
       pendingAttachmentsRef.current = [...pendingAttachmentsRef.current, pending];
       setPendingAttachments((prev) => [...prev, pending]);
