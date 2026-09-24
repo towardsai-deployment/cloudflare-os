@@ -47,11 +47,15 @@ import type {
 } from "../src/context-types";
 import {
   DEFAULT_GIT_BRANCH,
+  MAX_CONVERTIBLE_UPLOAD_BYTES,
   contentTypeFromPath,
+  isConvertibleDocumentPath,
   isImageContentType,
   isMarkdownContentType,
   isTextContentType,
+  isUnsupportedBinaryPath,
 } from "../src/context-types";
+import { formatByteSize, unsupportedFileTypeMessage } from "@gadgets/backend-utils/document-formats";
 import emojiData from "@emoji-mart/data";
 import { Picker as EmojiMartPicker } from "emoji-mart";
 import { Compartment, EditorState } from "@codemirror/state";
@@ -152,6 +156,15 @@ function fileToBase64(file: File): Promise<string> {
     reader.readAsDataURL(file);
   });
 }
+
+// A NUL byte near the start marks a binary file; stored "as text" it would be garbled Markdown.
+async function looksBinary(file: File): Promise<boolean> {
+  const head = new Uint8Array(await file.slice(0, 8192).arrayBuffer());
+  return head.includes(0);
+}
+
+// Upload failures reported in the toast description; the rest are summarized as a count.
+const MAX_LISTED_UPLOAD_FAILURES = 3;
 
 function dataUri(contentType: string, base64Body: string): string {
   return `data:${contentType};base64,${base64Body}`;
@@ -2444,8 +2457,8 @@ function CollectionEditor({
   };
 
   const uploadFiles = async (files: FileList) => {
-    let ok = 0,
-      failed = 0;
+    let ok = 0;
+    const failures: { name: string; reason: string }[] = [];
     await runWithConcurrency(Array.from(files), 6, async (file) => {
       const rel = (file as any).webkitRelativePath || file.name;
       // Derive the type from the path (its extension), not the browser-reported file.type, so the
@@ -2453,7 +2466,26 @@ function CollectionEditor({
       // extension). Trusting file.type caused e.g. .js to be stored base64 but shown as text.
       const ct = contentTypeFromPath(rel);
       try {
+        if (isUnsupportedBinaryPath(rel)) {
+          throw new Error(unsupportedFileTypeMessage(undefined, rel));
+        }
+        if (isConvertibleDocumentPath(rel)) {
+          // PDFs and Office documents are converted server-side and stored as <rel>.md.
+          if (file.size > MAX_CONVERTIBLE_UPLOAD_BYTES) {
+            throw new Error(
+              `${file.name} is ${formatByteSize(file.size)}; documents must be ` +
+              `${formatByteSize(MAX_CONVERTIBLE_UPLOAD_BYTES)} or smaller.`);
+          }
+          await context.importContextDocument(collectionId, rel, { base64: await fileToBase64(file) });
+          ok++;
+          return;
+        }
         const isText = isTextContentType(ct);
+        // Unknown extensions default to Markdown, so a binary file would otherwise be stored
+        // as garbled text and reported as a success.
+        if (isText && await looksBinary(file)) {
+          throw new Error(unsupportedFileTypeMessage(undefined, rel));
+        }
         const body = isText ? await file.text() : await fileToBase64(file);
         await context.putContextDocument(collectionId, rel, {
           // Self-describing files supply their own description; others start blank.
@@ -2462,13 +2494,23 @@ function CollectionEditor({
           contentType: ct,
         });
         ok++;
-      } catch {
-        failed++;
+      } catch (err) {
+        failures.push({ name: file.name, reason: (err as Error)?.message || "Upload failed" });
       }
     });
+    const listed = failures.slice(0, MAX_LISTED_UPLOAD_FAILURES);
+    const unlisted = failures.length - listed.length;
     toasts.add({
-      title: `Uploaded ${pluralize(ok, "file")}${failed ? `, ${failed} failed` : ""}`,
-      variant: failed ? "error" : "success",
+      title: `Uploaded ${pluralize(ok, "file")}${failures.length ? `, ${failures.length} failed` : ""}`,
+      description: failures.length ? (
+        <>
+          {listed.map((failure, index) => (
+            <div key={index}>{failure.name}: {failure.reason}</div>
+          ))}
+          {unlisted > 0 && <div>and {unlisted} more</div>}
+        </>
+      ) : undefined,
+      variant: failures.length ? "error" : "success",
     });
     await loadDocs();
   };
