@@ -2927,7 +2927,8 @@ class OverseerImpl implements AgentHooks {
       if (!content || content.state.type !== "staged") {
         throw new Error("Chat attachment not found.");
       }
-      assertChatAttachmentSupportedByProvider(provider, content.state.mimeType, content.data.byteLength);
+      assertChatAttachmentSupportedByProvider(
+          provider, content.state.mimeType, content.data.byteLength, content.state.name);
       total += content.data.byteLength;
       result.push({
         id,

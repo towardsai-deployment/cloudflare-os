@@ -7,6 +7,7 @@ import {
   MAX_CONVERTIBLE_CHAT_ATTACHMENT_BYTES,
   validateChatAttachmentUpload,
 } from "../src/chat-attachment-validation.js";
+import { isExpectedDocumentError } from "@gadgets/backend-utils/document-markdown";
 
 describe("assertChatAttachmentSupportedByProvider", () => {
   it("allows text and supported images without a selected model", () => {
@@ -15,8 +16,9 @@ describe("assertChatAttachmentSupportedByProvider", () => {
   });
 
   it("rejects pdfs without a selected model", () => {
+    // Uploads with no model are converted first, so a raw PDF here was staged for another model.
     expect(() => assertChatAttachmentSupportedByProvider(undefined, "application/pdf", 1))
-      .toThrow("Unsupported file type");
+      .toThrow("This attachment was attached for a model that reads PDFs directly.");
   });
 
   it("applies provider raw-file policy", () => {
@@ -32,17 +34,39 @@ describe("assertChatAttachmentSupportedByProvider", () => {
       .not.toThrow();
     expect(() => assertChatAttachmentSupportedByProvider("google", "application/zip", 1))
       .toThrow("Unsupported file type");
-    // Still true of the validator itself: uploads for such providers are converted to Markdown
-    // before validation (see chatAttachmentNeedsConversion), so a raw PDF never reaches it.
+    // Uploads for such providers are converted to Markdown before validation (see
+    // chatAttachmentNeedsConversion), so a raw PDF only reaches this check after a model switch.
     expect(() => assertChatAttachmentSupportedByProvider("cloudflare", "application/pdf", 1))
-      .toThrow("Unsupported file type");
+      .toThrow("was attached for a model that reads PDFs directly");
     expect(() => assertChatAttachmentSupportedByProvider("ollama", "application/zip", 1))
       .toThrow("Unsupported file type");
   });
 
-  it("enforces the per-file byte limit", () => {
+  it("enforces the per-file byte limit and states it", () => {
     expect(() => assertChatAttachmentSupportedByProvider(undefined, "text/plain", 1024 * 1024 + 1))
-      .toThrow("Chat attachment is too large.");
+      .toThrow("The attachment is 1.1 MB; attachments must be 1 MB or smaller.");
+    expect(() => assertChatAttachmentSupportedByProvider("anthropic", "application/pdf", 6 * 1024 * 1024, "report.pdf"))
+      .toThrow("report.pdf is 6 MB; attachments must be 1 MB or smaller.");
+  });
+
+  it("names the file when a PDF staged for a native-PDF model is sent to one without", () => {
+    // Attached while Claude was selected (kept as a raw PDF), then sent after switching.
+    expect(() => assertChatAttachmentSupportedByProvider("gateway-openai", "application/pdf", 1, "report.pdf"))
+      .toThrow("report.pdf was attached for a model that reads PDFs directly. Remove it and attach it " +
+        "again to convert it for the deployment's open models.");
+    expect(() => assertChatAttachmentSupportedByProvider("cloudflare", "application/pdf", 1, "report.pdf"))
+      .toThrow("to convert it for Workers AI models.");
+  });
+
+  it("tags its rejections as expected user errors", () => {
+    let err: unknown;
+    try {
+      assertChatAttachmentSupportedByProvider("cloudflare", "application/zip", 1, "bundle.zip");
+    } catch (caught) {
+      err = caught;
+    }
+    expect(isExpectedDocumentError(err)).toBe(true);
+    expect(err).toMatchObject({ kind: "unsupported" });
   });
 
   it("tells PowerPoint uploads to export as PDF", () => {

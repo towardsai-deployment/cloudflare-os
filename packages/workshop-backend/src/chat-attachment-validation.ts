@@ -1,8 +1,8 @@
 import { isTextLikeAttachmentMimeType } from "@gadgets/workshop-shared/api";
 import type { AiModelConfig, AiModelProvider, ChatAttachmentUpload } from "@gadgets/workshop-shared/api";
 import {
-  convertDocumentToMarkdown, convertibleDocumentFormat, documentMimeType, formatByteSize,
-  unsupportedFileTypeMessage,
+  convertDocumentToMarkdown, convertibleDocumentFormat, DocumentConversionError, documentMimeType,
+  formatByteSize, unsupportedFileTypeMessage,
 } from "@gadgets/backend-utils/document-markdown";
 import { PDF_MIME_TYPE } from "./chat-attachment-pdf";
 
@@ -65,7 +65,20 @@ function sanitizeChatAttachmentName(name: string | undefined): string | undefine
   return result || undefined;
 }
 
-/** Reject an attachment type that the selected provider cannot accept. */
+// How the re-attach message names the models a raw document can't reach.
+const PROVIDER_MODELS_LABEL = {
+  anthropic: "Claude models",
+  openai: "OpenAI models",
+  google: "Gemini models",
+  cloudflare: "Workers AI models",
+  ollama: "Ollama models",
+  "gateway-openai": "the deployment's open models",
+} satisfies Record<AiModelProvider, string>;
+
+/**
+ * Reject an attachment type that the selected provider cannot accept. The errors are expected
+ * DocumentConversionErrors ("too-large" or "unsupported"), which the UI doesn't report as issues.
+ */
 export function assertChatAttachmentSupportedByProvider(
   provider: AiModelProvider | undefined,
   mimeType: string,
@@ -73,12 +86,21 @@ export function assertChatAttachmentSupportedByProvider(
   name?: string,
 ): void {
   if (byteLength > MAX_CHAT_ATTACHMENT_BYTES) {
-    throw new Error("Chat attachment is too large.");
+    throw new DocumentConversionError("too-large",
+        `${name ?? "The attachment"} is ${formatByteSize(byteLength)}; attachments must be ` +
+        `${formatByteSize(MAX_CHAT_ATTACHMENT_BYTES)} or smaller.`);
   }
 
   if (provider ? ATTACHMENT_SUPPORT_BY_PROVIDER[provider](mimeType) : isTextOrImageMime(mimeType)) return;
 
-  throw new Error(unsupportedFileTypeMessage(mimeType, name));
+  // A raw document here was staged for a model that reads it natively, and the chat has since
+  // switched to one that doesn't; uploads for such models are converted before this check.
+  if (chatAttachmentNeedsConversion(provider, mimeType, name)) {
+    throw new DocumentConversionError("unsupported",
+        `${name ?? "This attachment"} was attached for a model that reads PDFs directly. Remove it and ` +
+        `attach it again to convert it for ${provider ? PROVIDER_MODELS_LABEL[provider] : "this chat"}.`);
+  }
+  throw new DocumentConversionError("unsupported", unsupportedFileTypeMessage(mimeType, name));
 }
 
 /**
@@ -108,7 +130,7 @@ export async function convertChatAttachmentToMarkdown(
 ): Promise<ChatAttachmentUpload> {
   let name = sanitizeChatAttachmentName(attachment.name) ?? "document";
   if (attachment.content.byteLength > MAX_CONVERTIBLE_CHAT_ATTACHMENT_BYTES) {
-    throw new Error(
+    throw new DocumentConversionError("too-large",
         `${name} is ${formatByteSize(attachment.content.byteLength)}; documents must be ` +
         `${formatByteSize(MAX_CONVERTIBLE_CHAT_ATTACHMENT_BYTES)} or smaller.`);
   }
@@ -116,7 +138,7 @@ export async function convertChatAttachmentToMarkdown(
   let markdown = await convertDocumentToMarkdown(ai, {name, bytes: attachment.content, mimeType}, {gateway});
   let content = new TextEncoder().encode(markdown);
   if (content.byteLength > MAX_CONVERTED_CHAT_ATTACHMENT_BYTES) {
-    throw new Error(
+    throw new DocumentConversionError("too-large",
         `${name} converts to ${formatByteSize(content.byteLength)} of text; the limit is ` +
         `${formatByteSize(MAX_CONVERTED_CHAT_ATTACHMENT_BYTES)}. Split it or upload only the pages you need.`);
   }
