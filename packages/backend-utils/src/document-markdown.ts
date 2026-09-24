@@ -3,23 +3,64 @@
 // embedded images in PDFs and Word documents are never sent to the paid image models, so a scanned
 // PDF yields no text and is rejected with a message rather than OCRed.
 
+import { convertibleDocumentFormat } from "./document-formats.js";
+import { createLogger } from "./logger.js";
+
 export * from "./document-formats.js";
 
-/** Why a document could not be converted; `message` is written for the person who uploaded it. */
+const logger = createLogger({ component: "backend-utils.document-markdown" });
+
+/**
+ * Why a document upload was refused or could not be converted; `message` is written for the
+ * person who uploaded it. `too-large`, `unsupported` and `no-text` are the uploader's to fix
+ * (see {@link EXPECTED_DOCUMENT_ERROR_KINDS}); the others point at the deployment or the service.
+ */
 export type DocumentConversionErrorKind =
   /** No Workers AI binding on this deployment. */
   | "unavailable"
   /** `toMarkdown()` threw or returned `format: "error"`. */
   | "failed"
   /** The conversion succeeded but produced (next to) no text, e.g. a scanned PDF. */
-  | "no-text";
+  | "no-text"
+  /** The upload, or its converted text, is over a size limit. */
+  | "too-large"
+  /** The file type can't be converted or accepted. */
+  | "unsupported";
 
-/** A conversion failure with a user-readable message. */
+/**
+ * Kinds that are ordinary user errors, not failures worth sending to an issue reporter. The
+ * `kind` is an own property, so it survives Cap'n Web and Workers RPC to the browser, where the
+ * chat UI keeps a copy of this list.
+ */
+export const EXPECTED_DOCUMENT_ERROR_KINDS: ReadonlySet<DocumentConversionErrorKind> =
+  new Set(["no-text", "too-large", "unsupported"]);
+
+/** A document upload failure with a user-readable message. */
 export class DocumentConversionError extends Error {
   constructor(readonly kind: DocumentConversionErrorKind, message: string) {
     super(message);
     this.name = "DocumentConversionError";
   }
+}
+
+/** Whether an error is a {@link DocumentConversionError} of one of the expected, user-caused kinds. */
+export function isExpectedDocumentError(err: unknown): boolean {
+  return err instanceof DocumentConversionError && EXPECTED_DOCUMENT_ERROR_KINDS.has(err.kind);
+}
+
+// Service error text reaches users and agents only when it is short and plain: a one-line reason
+// such as "file is encrypted", not a stack trace, URL or serialized object.
+function userFacingDetail(detail: string): string | undefined {
+  detail = detail.trim().replace(/[.\s]+$/, "");
+  if (!detail || detail.length > 100 || /[\n{}<>]|:\/\/|\bat\s+\S+\s*\(/.test(detail)) return undefined;
+  return detail;
+}
+
+function conversionFailed(name: string, detail: string, err?: unknown): DocumentConversionError {
+  // The full service error stays in the logs; the file name is left out of them.
+  logger.warn("document conversion failed", { event: "document.convert.failed", error: err ?? detail });
+  let shown = userFacingDetail(detail);
+  return new DocumentConversionError("failed", `Couldn't convert ${name} to text${shown ? `: ${shown}` : ""}.`);
 }
 
 /** The document handed to {@link convertDocumentToMarkdown}. */
@@ -80,18 +121,20 @@ export async function convertDocumentToMarkdown(
       },
     );
   } catch (err) {
-    throw new DocumentConversionError(
-      "failed", `Couldn't convert ${document.name} to text: ${err instanceof Error ? err.message : String(err)}.`);
+    throw conversionFailed(document.name, err instanceof Error ? err.message : String(err), err);
   }
 
   if (result.format === "error") {
-    throw new DocumentConversionError("failed", `Couldn't convert ${document.name} to text: ${result.error}.`);
+    throw conversionFailed(document.name, result.error);
   }
   if ((options.requireText ?? true) && extractedTextLength(result.data) < MIN_EXTRACTED_TEXT_CHARS) {
+    let label = convertibleDocumentFormat(document.mimeType)?.label ?? "document";
     throw new DocumentConversionError(
       "no-text",
-      `No text could be extracted from ${document.name}. It may be a scanned or image-only PDF; ` +
-        "run OCR on it first.");
+      document.mimeType === "application/pdf"
+        ? `No text could be extracted from ${document.name}. It may be a scanned or image-only PDF; ` +
+          "run OCR on it first."
+        : `No text could be extracted from ${document.name}. The ${label} may be empty or hold only images.`);
   }
   return result.data;
 }

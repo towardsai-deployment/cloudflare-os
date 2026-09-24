@@ -4,6 +4,7 @@ import {
   convertibleDocumentFormat,
   DocumentConversionError,
   documentMimeType,
+  isExpectedDocumentError,
   unsupportedFileTypeMessage,
 } from "../src/document-markdown.js";
 
@@ -55,6 +56,12 @@ describe("convertible document formats", () => {
     expect(unsupportedFileTypeMessage("application/zip", "bundle.zip"))
       .toMatch(/^Unsupported file type \(\.zip\)\. Supported documents: PDF/);
   });
+
+  it("doesn't call .key files Keynote, since PEM keys share the extension", () => {
+    expect(unsupportedFileTypeMessage("", "server.key")).toMatch(/^Unsupported file type \(\.key\)\./);
+    // The browser-reported Keynote type still gets the hint.
+    expect(unsupportedFileTypeMessage("application/vnd.apple.keynote", "talk.key")).toMatch(/Export it as PDF/);
+  });
 });
 
 describe("convertDocumentToMarkdown", () => {
@@ -78,6 +85,18 @@ describe("convertDocumentToMarkdown", () => {
     let err = await conversionError(convertDocumentToMarkdown(ai, doc));
     expect(err.kind).toBe("failed");
     expect(err.message).toBe("Couldn't convert report.pdf to text: parser blew up.");
+    expect(isExpectedDocumentError(err)).toBe(false);
+  });
+
+  it("keeps long or structured service errors out of the message", async () => {
+    let long = `Error: upstream 500 {"trace":"abc"}\n    at convert (worker.js:1:1)`;
+    let { ai } = aiReturning({ format: "error", error: long });
+    let err = await conversionError(convertDocumentToMarkdown(ai, doc));
+    expect(err.message).toBe("Couldn't convert report.pdf to text.");
+
+    let thrower = { toMarkdown: vi.fn(async () => { throw new Error("x".repeat(200)); }) } as unknown as Ai;
+    err = await conversionError(convertDocumentToMarkdown(thrower, doc));
+    expect(err.message).toBe("Couldn't convert report.pdf to text.");
   });
 
   it("reports a missing binding as kind 'unavailable'", async () => {
@@ -92,7 +111,14 @@ describe("convertDocumentToMarkdown", () => {
     let { ai } = aiReturning({ format: "markdown", tokens: 1, data: scanned });
     let err = await conversionError(convertDocumentToMarkdown(ai, { ...doc, name: "scan.pdf" }));
     expect(err.kind).toBe("no-text");
-    expect(err.message).toMatch(/^No text could be extracted from scan\.pdf\./);
+    expect(err.message).toMatch(/^No text could be extracted from scan\.pdf\. It may be a scanned or image-only PDF/);
+    expect(isExpectedDocumentError(err)).toBe(true);
+
+    // Other formats aren't blamed on scanning.
+    let docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    err = await conversionError(convertDocumentToMarkdown(ai, { ...doc, name: "memo.docx", mimeType: docx }));
+    expect(err.message).toBe(
+      "No text could be extracted from memo.docx. The Word document may be empty or hold only images.");
 
     // webFetch opts out: a short page is a legitimate result.
     await expect(convertDocumentToMarkdown(ai, doc, { requireText: false })).resolves.toBe(scanned);

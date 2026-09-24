@@ -48,7 +48,8 @@ const BY_EXTENSION = new Map(
 
 /**
  * Binary formats that look like documents but that `toMarkdown()` cannot convert, keyed by
- * extension, each with the message to show instead of a generic rejection.
+ * extension, each with the message to show instead of a generic rejection. `.key` is deliberately
+ * absent: it names Keynote files and PEM private keys alike, so it gets the generic message.
  */
 export const UNSUPPORTED_DOCUMENT_HINTS: ReadonlyMap<string, string> = new Map([
   ["pptx", "PowerPoint files (.pptx) can't be converted. Export it as PDF and upload that."],
@@ -56,18 +57,18 @@ export const UNSUPPORTED_DOCUMENT_HINTS: ReadonlyMap<string, string> = new Map([
   ["pps", "PowerPoint files (.pps) can't be converted. Export it as PDF and upload that."],
   ["ppsx", "PowerPoint files (.ppsx) can't be converted. Export it as PDF and upload that."],
   ["odp", "OpenDocument presentations (.odp) can't be converted. Export it as PDF and upload that."],
-  ["key", "Keynote files (.key) can't be converted. Export it as PDF and upload that."],
   ["doc", "Legacy Word files (.doc) can't be converted. Save it as .docx or PDF and upload that."],
   ["pages", "Pages files (.pages) can't be converted. Export it as PDF and upload that."],
 ]);
 
-const PRESENTATION_MIME_EXTENSIONS = new Map([
-  ["application/vnd.openxmlformats-officedocument.presentationml.presentation", "pptx"],
-  ["application/vnd.ms-powerpoint", "ppt"],
-  ["application/vnd.oasis.opendocument.presentation", "odp"],
-  ["application/vnd.apple.keynote", "key"],
-  ["application/msword", "doc"],
-  ["application/vnd.apple.pages", "pages"],
+// Hints by MIME type, for uploads whose browser-reported type is more telling than the name.
+const UNSUPPORTED_MIME_HINTS = new Map([
+  ["application/vnd.openxmlformats-officedocument.presentationml.presentation", UNSUPPORTED_DOCUMENT_HINTS.get("pptx")!],
+  ["application/vnd.ms-powerpoint", UNSUPPORTED_DOCUMENT_HINTS.get("ppt")!],
+  ["application/vnd.oasis.opendocument.presentation", UNSUPPORTED_DOCUMENT_HINTS.get("odp")!],
+  ["application/vnd.apple.keynote", "Keynote presentations can't be converted. Export it as PDF and upload that."],
+  ["application/msword", UNSUPPORTED_DOCUMENT_HINTS.get("doc")!],
+  ["application/vnd.apple.pages", UNSUPPORTED_DOCUMENT_HINTS.get("pages")!],
 ]);
 
 /** The lowercased extension of a file name or path, without the dot, or "" when it has none. */
@@ -107,16 +108,18 @@ export function isConvertibleDocumentName(name: string | undefined): boolean {
 export function unsupportedFileTypeMessage(mimeType: string | undefined, name?: string): string {
   let ext = fileExtension(name);
   let normalized = (mimeType ?? "").split(";", 1)[0].trim().toLowerCase();
-  let hint = UNSUPPORTED_DOCUMENT_HINTS.get(ext) ??
-    UNSUPPORTED_DOCUMENT_HINTS.get(PRESENTATION_MIME_EXTENSIONS.get(normalized) ?? "");
+  let hint = UNSUPPORTED_DOCUMENT_HINTS.get(ext) ?? UNSUPPORTED_MIME_HINTS.get(normalized);
   if (hint) return hint;
   let described = ext ? `.${ext}` : normalized || "unknown";
   return `Unsupported file type (${described}). Supported documents: ${SUPPORTED_DOCUMENTS_SUMMARY}.`;
 }
 
-/** Format a byte count for messages, in binary units ("256 KB", "16.2 MB"). */
+/**
+ * Format a byte count for messages, in binary units ("256 KB", "16.2 MB"). Rounds up, so a size
+ * just over a limit never prints as the limit itself ("10.1 MB; documents must be 10 MB").
+ */
 export function formatByteSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} bytes`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${Number((bytes / (1024 * 1024)).toFixed(1))} MB`;
+  if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KB`;
+  return `${Math.ceil(bytes / (1024 * 1024) * 10) / 10} MB`;
 }
