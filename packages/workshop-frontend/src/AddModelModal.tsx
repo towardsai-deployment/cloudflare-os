@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Dialog, Button, Input, Select, SensitiveInput, Textarea, Collapsible, useKumoToastManager } from '@cloudflare/kumo'
+import { Dialog, Button, Input, Select, SensitiveInput, Collapsible, useKumoToastManager } from '@cloudflare/kumo'
 import { AiChatAuthorInfo, AiModelConfig, AiModelProvider, AiGatewayInfo, SUGGESTED_MODELS } from '@gadgets/workshop-shared/api'
 import { RpcStub } from 'capnweb'
 import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
@@ -20,7 +20,6 @@ const PROVIDER_LABELS: Record<AiModelProvider, string> = {
   anthropic: 'Anthropic',
   openai: 'OpenAI',
   google: 'Google',
-  'google-vertex': 'Google Vertex AI',
   cloudflare: 'Cloudflare Workers AI',
   ollama: 'Ollama',
 }
@@ -30,27 +29,18 @@ const API_TOKEN_PLACEHOLDERS: Record<AiModelProvider, string> = {
   anthropic: 'sk-ant-...',
   openai: 'sk-...',
   google: 'AIza...',
-  'google-vertex': '{ "type": "service_account", "project_id": "...", ... }',
   cloudflare: 'Cloudflare API token',
   ollama: '(optional)',
 }
 
-// Examples used in the custom-model placeholders for providers that have no suggested models
-// (Ollama serves whatever the user has pulled locally; Vertex serves what the project enabled).
-const FALLBACK_EXAMPLE_MODELS: Partial<Record<AiModelProvider, { modelId: string, name: string }>> = {
-  'google-vertex': { modelId: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
-}
+// Example used in the custom-model placeholders for providers that have no suggested models
+// (currently Ollama, which serves whatever the user has pulled locally).
 const FALLBACK_EXAMPLE_MODEL = { modelId: 'gemma4:31b', name: 'Gemma 4 31B' }
-
-// Vertex region offered by default; the backend assumes the same when none is stored.
-const DEFAULT_VERTEX_LOCATION = 'us-central1'
 
 // Pick an example model to show in the custom-model placeholders for the given provider.
 function exampleModel(provider: AiModelProvider): { modelId: string, name: string } {
   const first = Object.entries(SUGGESTED_MODELS[provider])[0]
-  return first
-    ? { modelId: first[0], name: first[1].name }
-    : FALLBACK_EXAMPLE_MODELS[provider] ?? FALLBACK_EXAMPLE_MODEL
+  return first ? { modelId: first[0], name: first[1].name } : FALLBACK_EXAMPLE_MODEL
 }
 
 // Encode a selection into a string value for the Select component.
@@ -112,7 +102,6 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
   const [apiToken, setApiToken] = useState('')
   const [accountId, setAccountId] = useState('')
   const [apiUrl, setApiUrl] = useState('')
-  const [location, setLocation] = useState('')
 
   // Validation errors
   const [errors, setErrors] = useState<Record<string, string>>({})
@@ -135,7 +124,6 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
       setApiToken('')
       setAccountId('')
       setApiUrl('')
-      setLocation('')
       setErrors({})
       setAdvancedOpen(false)
     }
@@ -157,7 +145,6 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
     setApiToken('')
     setAccountId('')
     setApiUrl(sel.provider === 'ollama' ? 'http://localhost:11434' : '')
-    setLocation(sel.provider === 'google-vertex' ? DEFAULT_VERTEX_LOCATION : '')
   }
 
   const validate = (): boolean => {
@@ -174,21 +161,14 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
 
     const isOllama = selection?.provider === 'ollama'
     const isCloudflare = selection?.provider === 'cloudflare'
-    const isVertex = selection?.provider === 'google-vertex'
     const showCredentials = !gatewayMode
 
     if (showCredentials && selection && !isOllama && !apiToken.trim()) {
-      newErrors.apiToken = isVertex
-        ? 'Please paste your service account key'
-        : 'Please enter your API token'
+      newErrors.apiToken = 'Please enter your API token'
     }
 
     if (showCredentials && isCloudflare && !accountId.trim()) {
       newErrors.accountId = 'Please enter your Cloudflare account ID'
-    }
-
-    if (showCredentials && isVertex && !location.trim()) {
-      newErrors.location = 'Please enter the Google Cloud region'
     }
 
     if (showCredentials && isOllama && !apiUrl.trim()) {
@@ -220,7 +200,6 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
         apiToken: gatewayMode ? '' : apiToken.trim(),
         ...(!gatewayMode && accountId.trim() && { accountId: accountId.trim() }),
         ...(!gatewayMode && apiUrl.trim() && { apiUrl: apiUrl.trim() }),
-        ...(!gatewayMode && location.trim() && { location: location.trim() }),
       }
 
       await authenticatedApi.addModel(profile, config)
@@ -239,7 +218,6 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
   const example = selection ? exampleModel(selection.provider) : null
   const isOllama = selection?.provider === 'ollama'
   const isCloudflare = selection?.provider === 'cloudflare'
-  const isVertex = selection?.provider === 'google-vertex'
   const showCredentials = !gatewayMode
 
   // Group options by provider for rendering with visual separators.
@@ -329,36 +307,8 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
             />
           )}
 
-          {/* Vertex AI region (endpoints and model paths are region-scoped) */}
-          {showCredentials && isVertex && (
-            <Input
-              label="Region"
-              placeholder={DEFAULT_VERTEX_LOCATION}
-              description="The Google Cloud region serving the model (or 'global')"
-              value={location}
-              onChange={(e) => { setLocation(e.target.value); setErrors(prev => ({ ...prev, location: '' })) }}
-              error={errors.location}
-              variant={errors.location ? 'error' : 'default'}
-            />
-          )}
-
-          {/* Vertex AI credential: a service-account key file rather than a token */}
-          {showCredentials && isVertex && (
-            <Textarea
-              label="Service Account Key"
-              placeholder={API_TOKEN_PLACEHOLDERS['google-vertex']}
-              description="Paste the JSON key file of a service account with the Vertex AI User role; the project is read from it"
-              rows={4}
-              className="w-full font-mono text-xs"
-              value={apiToken}
-              onValueChange={(v) => { setApiToken(v); setErrors(prev => ({ ...prev, apiToken: '' })) }}
-              error={errors.apiToken}
-              variant={errors.apiToken ? 'error' : 'default'}
-            />
-          )}
-
           {/* API Token */}
-          {showCredentials && selection && !isVertex && (
+          {showCredentials && selection && (
             <SensitiveInput
               label="API Token"
               placeholder={API_TOKEN_PLACEHOLDERS[selection.provider]}

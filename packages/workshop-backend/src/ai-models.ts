@@ -6,18 +6,14 @@ import type {
 } from "@earendil-works/pi-ai";
 import { stream as anthropicMessagesStream } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { stream as googleGenerativeAiStream } from "@earendil-works/pi-ai/api/google-generative-ai";
-import { stream as googleVertexStream } from "@earendil-works/pi-ai/api/google-vertex";
 import { stream as openaiCompletionsStream } from "@earendil-works/pi-ai/api/openai-completions";
 import { stream as openaiResponsesStream } from "@earendil-works/pi-ai/api/openai-responses";
 import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
 import { CLOUDFLARE_WORKERS_AI_MODELS } from "@earendil-works/pi-ai/providers/cloudflare-workers-ai.models";
 import { GOOGLE_MODELS } from "@earendil-works/pi-ai/providers/google.models";
-import { GOOGLE_VERTEX_MODELS } from "@earendil-works/pi-ai/providers/google-vertex.models";
 import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { ApprovalQueue, Gatekeeper, ResourceDescription, stripTrailingSlashes } from '@gadgets/workshop-shared/gatekeeper';
 import { LanguageModelBinding } from "./ai-model-binding";
-import { createAccessTokenSource, parseServiceAccountKey, withBearerToken }
-    from "./google-vertex-auth";
 import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
 import { AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT }
   from "@gadgets/workshop-shared/api";
@@ -125,7 +121,6 @@ const API_STREAMS: Record<string, StreamFunction<Api, SimpleStreamOptions>> = {
   "openai-responses": openaiResponsesStream as StreamFunction<Api, SimpleStreamOptions>,
   "openai-completions": openaiCompletionsStream as StreamFunction<Api, SimpleStreamOptions>,
   "google-generative-ai": googleGenerativeAiStream as StreamFunction<Api, SimpleStreamOptions>,
-  "google-vertex": googleVertexStream as StreamFunction<Api, SimpleStreamOptions>,
 };
 
 const ZERO_COST: ModelCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -137,7 +132,6 @@ function catalogModel(provider: AiModelConfig["provider"], modelId: string): Mod
     case "anthropic": return (ANTHROPIC_MODELS as Record<string, Model<Api>>)[modelId];
     case "openai": return (OPENAI_MODELS as Record<string, Model<Api>>)[modelId];
     case "google": return (GOOGLE_MODELS as Record<string, Model<Api>>)[modelId];
-    case "google-vertex": return (GOOGLE_VERTEX_MODELS as Record<string, Model<Api>>)[modelId];
     case "cloudflare": return (CLOUDFLARE_WORKERS_AI_MODELS as Record<string, Model<Api>>)[modelId];
     case "ollama": return undefined;
     default: return undefined;
@@ -280,11 +274,6 @@ type HandleArgs = {
   // gateway over env.WORKERS_AI.fetch() instead of the global fetch (see bindingFetch).
   // A per-call options.fetch still wins, which tests rely on to capture requests.
   fetch?: FetchFunction;
-  // Per-request auth for a provider whose credential is minted rather than stored (Vertex: a
-  // short-lived OAuth2 token from the config's service-account key). Runs in pi's onPayload
-  // hook -- the one awaited point inside the adapter's request path -- so a failed mint surfaces
-  // like any provider failure, as an error-stop message rather than a rejected stream.
-  authorizePayload?: (payload: unknown) => Promise<unknown>;
 };
 
 function makeHandle(args: HandleArgs): ModelHandle {
@@ -348,9 +337,8 @@ function makeHandle(args: HandleArgs): ModelHandle {
         // PDF attachments ride pi image parts and are rewritten here into the provider's native
         // document blocks (no-op for payloads without one; see chat-attachment-pdf.ts).
         onPayload: async (payload, payloadModel) => {
-          let replaced = await options.onPayload?.(payload, payloadModel) ?? payload;
-          replaced = bridgePdfAttachments(args.model.api, replaced) ?? replaced;
-          return args.authorizePayload ? await args.authorizePayload(replaced) : replaced;
+          const replaced = await options.onPayload?.(payload, payloadModel);
+          return bridgePdfAttachments(args.model.api, replaced ?? payload) ?? replaced;
         },
       };
       return streamFn(model, context, merged);
@@ -434,16 +422,6 @@ function getModelViaUserGateway(
  * recognizes and strips it rather than treating it as a BYOK provider key.
  */
 const CLOUDFLARE_GATEWAY_BINDING_AUTH_SENTINEL = "cloudflare-gateway-binding";
-
-/**
- * Placeholder API key for direct Vertex handles, which authenticate with a bearer token instead
- * (see getModelDirect). pi and the @google/genai SDK both insist on a key before dispatch; any
- * value except pi's own ADC marker ("gcp-vertex-credentials") and "<placeholder>" forms works.
- */
-const VERTEX_SDK_API_KEY_PLACEHOLDER = "vertex-service-account";
-
-/** Region used for a Vertex model whose config predates or omits `location`. */
-const DEFAULT_VERTEX_LOCATION = "us-central1";
 
 /**
  * `Ai#fetch` exists at runtime but @cloudflare/workers-types' `Ai` doesn't declare it, so the
@@ -593,40 +571,6 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
         apiKey: config.apiToken,
         sessionAffinity,
       });
-    case "google-vertex": {
-      // BYOK only (see HTTPS_ONLY_PROVIDERS in ai-gateway.ts -- pi's Vertex adapter rejects a
-      // custom fetch, so it can't ride the Workers AI binding transport gateway mode uses).
-      //
-      // Vertex takes only OAuth2 bearer tokens, and wrangler bundles the browser build of
-      // @google/genai, which has no project-based auth at all (that path is Node-only, through
-      // google-auth-library). So the SDK is driven in its API-key mode with a placeholder key,
-      // the project/location collection is addressed through baseUrl (pi marks a custom baseUrl
-      // as collection-scoped, so the SDK appends only publishers/<publisher>/models/<id>), and
-      // every request carries a service-account token minted by google-vertex-auth.ts. Vertex
-      // honors the bearer token and ignores the placeholder `x-goog-api-key` (verified live).
-      const key = parseServiceAccountKey(config.apiToken);
-      const location = config.location ?? DEFAULT_VERTEX_LOCATION;
-      const host = location === "global"
-          ? "https://aiplatform.googleapis.com" : `https://${location}-aiplatform.googleapis.com`;
-      const accessToken = createAccessTokenSource(key);
-      return makeHandle({
-        model: {
-          id: config.model,
-          name: catalog?.name ?? config.model,
-          api: "google-vertex",
-          provider: "google-vertex",
-          baseUrl: `${config.apiUrl ?? host}/v1/projects/${key.projectId}/locations/${location}`,
-          reasoning: catalog?.reasoning ?? true,
-          input: catalog?.input ?? ["text", "image"],
-          cost: catalog?.cost ?? ZERO_COST,
-          ...window,
-          thinkingLevelMap: catalog?.thinkingLevelMap,
-        },
-        apiKey: VERTEX_SDK_API_KEY_PLACEHOLDER,
-        authorizePayload: async payload => withBearerToken(payload, await accessToken()),
-        sessionAffinity,
-      });
-    }
     case "ollama":
       // `apiUrl` is the Ollama server base; its OpenAI-compat endpoint lives under /v1. Accept
       // (and strip) a trailing `/api` or `/v1` path: configs saved before the pi migration store

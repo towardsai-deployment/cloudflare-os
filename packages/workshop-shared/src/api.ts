@@ -1133,8 +1133,7 @@ export type CloudflareAccountOption = {
 };
 
 /** Supported AI providers. */
-export type AiModelProvider =
-    "openai" | "anthropic" | "google" | "google-vertex" | "cloudflare" | "ollama";
+export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
 
 /** Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`. */
 export type AiGatewayInfo = {
@@ -1167,13 +1166,6 @@ export type AiModelConfig = {
    * alternative provider that provides a compatible API.
    */
   apiUrl?: string;
-
-  /**
-   * Google Cloud region serving the model, e.g. "us-central1" or "global". Used only by provider
-   * "google-vertex", whose endpoints and request paths are region-scoped (`apiToken` is then a
-   * service-account JSON key, which names the project); defaults to "us-central1".
-   */
-  location?: string;
 };
 
 /**
@@ -1214,11 +1206,6 @@ export const SUGGESTED_MODELS: Record<
   },
   "google": {
     "gemini-3.6-flash": {name: "Gemini 3.6 Flash", contextWindow: 1048576},
-  },
-  // No suggested models: which Gemini ids Vertex serves varies by region and project (the
-  // newest ids are often absent from a region), so users add the model they've enabled as a
-  // custom model -- as with Ollama below.
-  "google-vertex": {
   },
   "ollama": {
   },

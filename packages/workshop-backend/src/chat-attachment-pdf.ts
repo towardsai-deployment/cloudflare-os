@@ -8,8 +8,8 @@ import type { Api } from "@earendil-works/pi-ai";
 // application/pdf (see the history replay in agent.ts), and the disguise is fixed up per API at
 // the last moment, in the onPayload hook that ai-models.ts installs on every model handle:
 //
-// - google-generative-ai, google-vertex: nothing to fix. Gemini natively accepts application/pdf
-//   inlineData, which is exactly what both adapters emit.
+// - google-generative-ai: nothing to fix. Gemini natively accepts application/pdf inlineData,
+//   which is exactly what the adapter emits.
 // - anthropic-messages: the adapter emits {type: "image", source: {type: "base64", media_type:
 //   "application/pdf", data}}; Anthropic's real PDF block is the same object tagged "document".
 // - openai-responses: the adapter emits {type: "input_image", image_url:
@@ -28,7 +28,7 @@ export const PDF_MIME_TYPE = "application/pdf";
 /** Whether PDF attachments can reach this pi API (natively or via bridgePdfAttachments()). */
 export function modelApiSupportsPdfAttachments(api: Api): boolean {
   return api === "anthropic-messages" || api === "openai-responses" ||
-      api === "google-generative-ai" || api === "google-vertex";
+      api === "google-generative-ai";
 }
 
 /**
