@@ -375,6 +375,12 @@ function makeHandle(args: HandleArgs): ModelHandle {
             : args.model.api === "anthropic-messages" ? { thinkingEnabled: false } : {}),
         ...(args.fetch !== undefined ? { fetch: args.fetch } : {}),
         ...options,
+        // Open models have no SUGGESTED_MODELS entry, so callers (agent-compaction's token
+        // limits) pass no maxTokens for them; default to the deployment's configured output
+        // limit instead of letting pi omit max_tokens and leave the provider's cap in charge.
+        ...(args.model.provider === "gateway-openai" && options.maxTokens === undefined
+            ? { maxTokens: args.model.maxTokens }
+            : {}),
         ...(args.apiKey !== undefined ? { apiKey: args.apiKey } : {}),
         ...(Object.keys(headers).length > 0 ? { headers } : {}),
         // Session affinity: pi only sends it when caching isn't "none" (fine for us).

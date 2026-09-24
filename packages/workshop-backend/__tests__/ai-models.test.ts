@@ -421,11 +421,14 @@ describe("getModel AI Gateway binding transport", () => {
       return new AiGatewayConfig(testEnv).resolveModel(id)!.config;
     }
 
-    async function captureOpenEntry(handle: ModelHandle): Promise<CapturedBindingRequest> {
+    async function captureOpenEntry(
+        // null: call without maxTokens, as the agent loop does for models it has no limits for.
+        handle: ModelHandle, maxTokens: number | null = 1024,
+    ): Promise<CapturedBindingRequest> {
       const stream = handle.stream(handle.model, {
         systemPrompt: "You are a coding agent.",
         messages: [{ role: "user", content: "hello", timestamp: 0 }],
-      }, { maxRetries: 0, maxTokens: 1024 });
+      }, { maxRetries: 0, maxTokens: maxTokens ?? undefined });
       expect((await stream.result()).stopReason).toBe("error");
       return capturedEntries[0];
     }
@@ -478,6 +481,16 @@ describe("getModel AI Gateway binding transport", () => {
       expect(body).not.toHaveProperty("max_completion_tokens");
       expect(body).not.toHaveProperty("store");
       expect(body).not.toHaveProperty("reasoning_effort");
+    }, 15000);
+
+    it("defaults max_tokens to the configured output limit when the caller passes none",
+        async () => {
+      // agent-compaction finds no SUGGESTED_MODELS entry for an open model, so the agent loop
+      // calls with maxTokens undefined.
+      const testEnv = openEnv([{ ...QWEN, outputLimit: 32000 }]);
+      const entry = await captureOpenEntry(
+          getModel(testEnv, openConfig(testEnv), INITIATOR), null);
+      expect((JSON.parse(entry.body) as { max_tokens?: number }).max_tokens).toBe(32000);
     }, 15000);
 
     it("sends the cache-read price when configured, and no cost header without prices",
