@@ -15,8 +15,9 @@ import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { ApprovalQueue, Gatekeeper, ResourceDescription, stripTrailingSlashes } from '@gadgets/workshop-shared/gatekeeper';
 import { LanguageModelBinding } from "./ai-model-binding";
 import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
-import { AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT }
-  from "@gadgets/workshop-shared/api";
+import {
+  AiChatAuthorInfo, AiModelConfig, OpenModelConfig, SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT,
+} from "@gadgets/workshop-shared/api";
 import { AiGatewayConfig, getAiGatewayConfig, type AiGatewayLogRoute } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
@@ -164,6 +165,31 @@ function workersAiCompat(catalog: Model<Api> | undefined): OpenAICompletionsComp
   };
 }
 
+// Compat flags for a deployment's open model (provider "gateway-openai"), which pi can't detect
+// from the gateway URL, so its OpenAI defaults would apply. The target is a generic
+// OpenAI-compatible endpoint (e.g. Vertex AI's), so nothing OpenAI-only is sent: no `store`, no
+// `developer` role, `max_tokens` rather than `max_completion_tokens`, no `reasoning_effort`, no
+// per-tool `strict` flag, and no extended prompt-cache retention.
+const OPEN_MODEL_COMPAT: OpenAICompletionsCompat = {
+  supportsStore: false,
+  supportsDeveloperRole: false,
+  maxTokensField: "max_tokens",
+  supportsReasoningEffort: false,
+  supportsStrictMode: false,
+  supportsLongCacheRetention: false,
+};
+
+// AI Gateway's `cf-aig-custom-cost` header value for an open model's configured prices, so the
+// gateway logs a cost for models it has no price for. The header takes USD per token; the config
+// gives USD per 1M tokens.
+function customCostHeader(cost: NonNullable<OpenModelConfig["cost"]>): string {
+  return JSON.stringify({
+    per_token_in: cost.input / 1_000_000,
+    per_token_out: cost.output / 1_000_000,
+    ...(cost.cacheRead !== undefined ? { per_cache_read_token: cost.cacheRead / 1_000_000 } : {}),
+  });
+}
+
 // Build the pi model descriptor for reaching a provider's own native API through an AI Gateway
 // (the platform's or a user's). `gatewayUrl` is a gateway root -- over HTTPS
 // (https://gateway.ai.cloudflare.com/v1/{accountId}/{gateway}) or, for binding-routed requests,
@@ -174,8 +200,10 @@ function workersAiCompat(catalog: Model<Api> | undefined): OpenAICompletionsComp
 // provider's native API, and the translation drops provider features pi relies on (extended
 // thinking, Anthropic cache_control prompt caching, the OpenAI Responses API). Billing --
 // including unified billing on a user's own gateway -- is orthogonal to which API a request
-// speaks. Returns undefined for providers AI Gateway cannot serve (ollama).
-function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string): Model<Api> | undefined {
+// speaks. `openModel` is the deployment's entry for a "gateway-openai" config. Returns undefined
+// for providers AI Gateway cannot serve (ollama) and for a "gateway-openai" config without one.
+function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string,
+                            openModel?: OpenModelConfig): Model<Api> | undefined {
   const catalog = catalogModel(config.provider, config.model);
   const window = modelTokenWindow(config, catalog);
   switch (config.provider) {
@@ -242,6 +270,30 @@ function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string): Model<Ap
         cost: catalog?.cost ?? ZERO_COST,
         ...window,
         compat: workersAiCompat(catalog),
+      };
+    case "gateway-openai":
+      // A deployment-declared OpenAI-compatible model at a path on the gateway (e.g. Vertex AI's
+      // OpenAI endpoint); the gateway injects the provider key it stores for that route. pi
+      // appends /chat/completions to the baseUrl.
+      if (!openModel) return undefined;
+      return {
+        id: openModel.model,
+        name: openModel.name,
+        api: "openai-completions",
+        provider: "gateway-openai",
+        baseUrl: `${gatewayUrl}/${openModel.gatewayPath}`,
+        reasoning: false,
+        input: ["text"],
+        cost: openModel.cost
+            ? { cacheRead: 0, ...openModel.cost, cacheWrite: 0 }
+            : ZERO_COST,
+        contextWindow: openModel.contextWindow,
+        maxTokens: openModel.outputLimit,
+        compat: OPEN_MODEL_COMPAT,
+        // pi sends model headers on every request, beneath the handle's auth headers.
+        ...(openModel.cost
+            ? { headers: { "cf-aig-custom-cost": customCostHeader(openModel.cost) } }
+            : {}),
       };
     default:
       return undefined;
@@ -359,7 +411,9 @@ export function getModel(env: Cloudflare.Env, config: AiModelConfig,
   // BYOK: a connected user's own Cloudflare account pays for everything (all providers, including
   // Workers AI), routed through the user's own AI Gateway with unified billing. Honored regardless
   // of whether a platform AI Gateway is configured, so connected users are always billed correctly.
-  if (options.userGateway) {
+  // The exception is the deployment's open models ("gateway-openai"): their provider key is
+  // stored only on the platform gateway, so they always ride it.
+  if (options.userGateway && config.provider !== "gateway-openai") {
     return getModelViaUserGateway(
         config, buildMetadata(initiator, options.metadata), options.userGateway,
         options.sessionAffinity);
@@ -376,8 +430,9 @@ export function getModel(env: Cloudflare.Env, config: AiModelConfig,
 }
 
 // Route inference through the user's own account (unified billing) via their account's default AI
-// Gateway. Supports every provider AI Gateway serves, including Workers AI. Billed to the
-// user's Cloudflare credits; no provider API key required.
+// Gateway. Supports every provider AI Gateway serves, including Workers AI, but not the
+// deployment's open models (getModel keeps those on the platform gateway). Billed to the user's
+// Cloudflare credits; no provider API key required.
 function getModelViaUserGateway(
   config: AiModelConfig,
   metadata: GatewayMetadata,
@@ -479,7 +534,7 @@ function getModelViaGateway(
   const gatewayUrl = binding
       ? `https://workers-binding.ai/ai-gateway/gateways/${gateway}`
       : `${gatewayBase}/${gateway}`;
-  const model = gatewayNativeModel(config, gatewayUrl);
+  const model = gatewayNativeModel(config, gatewayUrl, gwConfig.openModels.get(config.model));
   if (!model) {
     throw new Error(
       `Provider "${config.provider}" is not supported through AI Gateway. ` +
@@ -639,6 +694,9 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
         apiKey: config.apiToken,
         sessionAffinity,
       });
+    case "gateway-openai":
+      throw new Error(
+          `Model "${config.model}" is only available through the deployment's AI Gateway.`);
     default:
       config.provider satisfies never;
       throw new Error(`Unknown provider "${config.provider}".`);

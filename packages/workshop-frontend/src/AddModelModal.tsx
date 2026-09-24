@@ -22,6 +22,7 @@ const PROVIDER_LABELS: Record<AiModelProvider, string> = {
   google: 'Google',
   cloudflare: 'Cloudflare Workers AI',
   ollama: 'Ollama',
+  'gateway-openai': 'AI Gateway open model',
 }
 
 // Placeholder hinting at the shape of each provider's API token.
@@ -31,6 +32,7 @@ const API_TOKEN_PLACEHOLDERS: Record<AiModelProvider, string> = {
   google: 'AIza...',
   cloudflare: 'Cloudflare API token',
   ollama: '(optional)',
+  'gateway-openai': '',
 }
 
 // Example used in the custom-model placeholders for providers that have no suggested models
@@ -67,6 +69,8 @@ function buildOptions(gatewayMode: boolean, enabledProviders: Set<string> | null
 
   for (const provider of providerOrder) {
     if (enabledProviders && !enabledProviders.has(provider)) continue
+    // Open models come only from the deployment's config; users can't add their own.
+    if (provider === 'gateway-openai') continue
 
     // In gateway mode, suggested models are already built-in, so don't list them.
     if (!gatewayMode) {

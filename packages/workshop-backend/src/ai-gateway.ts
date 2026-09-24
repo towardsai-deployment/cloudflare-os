@@ -1,5 +1,9 @@
-import { AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS } from "@gadgets/workshop-shared/api";
+import { AiChatAuthorInfo, AiModelConfig, OpenModelConfig, SUGGESTED_MODELS }
+  from "@gadgets/workshop-shared/api";
+import { createWorkshopLogger } from "./observability.js";
 import { UserAiModelRecord } from "./user.js";
+
+const logger = createWorkshopLogger("workshop.ai-gateway");
 
 // The model used for quick tasks like title generation when AI Gateway mode is active.
 //
@@ -21,6 +25,90 @@ const QUICK_MODEL_ID = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
  * https://github.com/earendil-works/pi/blob/v0.84.2/packages/ai/src/api/google-vertex.ts#L98
  */
 const HTTPS_ONLY_PROVIDERS = new Set(["google"]);
+
+const isNonEmptyString = (value: unknown): value is string =>
+  typeof value === "string" && value.trim() !== "";
+const isPositiveInteger = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+const isPrice = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0;
+
+// A relative route under the gateway root: non-empty segments, no dot segments, and none of the
+// characters that would let the path escape it once joined (scheme, query, fragment, backslash,
+// percent-encoding such as %2e%2e, whitespace).
+function isGatewayPath(value: unknown): value is string {
+  return typeof value === "string" && !/^[a-z][a-z0-9+.-]*:/i.test(value) &&
+      !/[?#\\%\s]/.test(value) &&
+      value.split("/").every(segment => segment !== "" && segment !== "." && segment !== "..");
+}
+
+// Returns the validated entry, or a reason it was rejected. Copies only the known fields.
+function validateOpenModel(value: unknown): OpenModelConfig | string {
+  if (typeof value !== "object" || value === null) return "not an object";
+  const entry = value as Record<string, unknown>;
+  if (!isNonEmptyString(entry.id)) return "id must be a non-empty string";
+  if (!isNonEmptyString(entry.name)) return "name must be a non-empty string";
+  if (!isGatewayPath(entry.gatewayPath)) {
+    return "gatewayPath must be a relative path with no scheme, no leading or trailing " +
+        "slash, and no '..'";
+  }
+  if (!isNonEmptyString(entry.model)) return "model must be a non-empty string";
+  if (!isPositiveInteger(entry.contextWindow)) return "contextWindow must be a positive integer";
+  if (!isPositiveInteger(entry.outputLimit)) return "outputLimit must be a positive integer";
+  const result: OpenModelConfig = {
+    id: entry.id, name: entry.name, gatewayPath: entry.gatewayPath, model: entry.model,
+    contextWindow: entry.contextWindow, outputLimit: entry.outputLimit,
+  };
+  if (entry.cost !== undefined) {
+    const cost = entry.cost as Record<string, unknown> | null;
+    if (typeof cost !== "object" || cost === null || !isPrice(cost.input) ||
+        !isPrice(cost.output) || (cost.cacheRead !== undefined && !isPrice(cost.cacheRead))) {
+      return "cost must have non-negative input and output prices (and cacheRead, if set)";
+    }
+    result.cost = {
+      input: cost.input, output: cost.output,
+      ...(cost.cacheRead !== undefined ? { cacheRead: cost.cacheRead as number } : {}),
+    };
+  }
+  return result;
+}
+
+/**
+ * Parse CF_AI_GATEWAY_OPEN_MODELS (a JSON array of OpenModelConfig) into a map keyed by id.
+ * Deployment config must never take down the model list, so malformed JSON and invalid or
+ * duplicate entries are logged and skipped rather than thrown.
+ */
+function parseOpenModels(raw: string | undefined): Map<string, OpenModelConfig> {
+  const result = new Map<string, OpenModelConfig>();
+  if (!raw?.trim()) return result;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    logger.warn("ignoring malformed CF_AI_GATEWAY_OPEN_MODELS", {
+      event: "ai-gateway.open-models.invalid", error,
+    });
+    return result;
+  }
+  if (!Array.isArray(parsed)) {
+    logger.warn("ignoring malformed CF_AI_GATEWAY_OPEN_MODELS", {
+      event: "ai-gateway.open-models.invalid", error: "not a JSON array",
+    });
+    return result;
+  }
+  for (const [index, value] of parsed.entries()) {
+    const entry = validateOpenModel(value);
+    if (typeof entry !== "string" && !result.has(entry.id)) {
+      result.set(entry.id, entry);
+      continue;
+    }
+    logger.warn("skipping invalid CF_AI_GATEWAY_OPEN_MODELS entry", {
+      event: "ai-gateway.open-models.invalid",
+      error: `entry ${index}: ${typeof entry === "string" ? entry : "duplicate id"}`,
+    });
+  }
+  return result;
+}
 
 export class AiGatewayConfig {
   readonly gateway: string;
@@ -47,6 +135,11 @@ export class AiGatewayConfig {
    */
   readonly binding?: Ai;
   readonly providers: Set<string>;
+  /**
+   * The deployment's open models (provider "gateway-openai"), keyed by their user-visible id.
+   * Empty unless "gateway-openai" is an enabled provider.
+   */
+  readonly openModels: ReadonlyMap<string, OpenModelConfig>;
 
   constructor(env: Cloudflare.Env) {
     this.gateway = env.CF_AI_GATEWAY!;
@@ -83,6 +176,9 @@ export class AiGatewayConfig {
           `${names} provider${httpsOnly.length > 1 ? "s" : ""} requires ` +
           "CF_AI_GATEWAY_API_TOKEN.");
     }
+    this.openModels = this.providers.has("gateway-openai")
+        ? parseOpenModels(env.CF_AI_GATEWAY_OPEN_MODELS)
+        : new Map();
   }
 
   /**
@@ -95,7 +191,8 @@ export class AiGatewayConfig {
   }
 
   /**
-   * Get the list of models available through AI Gateway, as AiChatAuthorInfo entries.
+   * Get the list of models available through AI Gateway, as AiChatAuthorInfo entries: the
+   * SUGGESTED_MODELS of enabled providers, then the deployment's open models.
    */
   getModelList(): AiChatAuthorInfo[] {
     let result: AiChatAuthorInfo[] = [];
@@ -106,12 +203,16 @@ export class AiGatewayConfig {
         }
       }
     }
+    for (let model of this.openModels.values()) {
+      result.push({ type: "agent", id: model.id, name: model.name });
+    }
     return result;
   }
 
   /**
    * Look up an AI Gateway model by ID. Returns a UserAiModelRecord if the model is a
-   * SUGGESTED_MODEL for an enabled gateway provider, or undefined otherwise.
+   * SUGGESTED_MODEL for an enabled gateway provider or one of the deployment's open models, or
+   * undefined otherwise.
    */
   resolveModel(modelId: string): UserAiModelRecord | undefined {
     for (let [provider, models] of Object.entries(SUGGESTED_MODELS)) {
@@ -128,6 +229,14 @@ export class AiGatewayConfig {
           },
         };
       }
+    }
+    let openModel = this.openModels.get(modelId);
+    if (openModel) {
+      return {
+        profile: { type: "agent", id: openModel.id, name: openModel.name },
+        // getModel() looks the entry up again by id, so the config carries no route or key.
+        config: { provider: "gateway-openai", model: openModel.id, apiToken: "" },
+      };
     }
     return undefined;
   }

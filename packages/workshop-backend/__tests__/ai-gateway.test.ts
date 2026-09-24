@@ -4,6 +4,7 @@ import {
   AiGatewayLogRetryableError,
   getAiGatewayLogCost,
 } from "../src/ai-gateway.js";
+import { UserDurableObject } from "../src/user.js";
 
 function env(overrides: Partial<Cloudflare.Env> = {}): Cloudflare.Env {
   return {
@@ -119,6 +120,109 @@ describe("AiGatewayConfig transport selection", () => {
       CF_AI_GATEWAY_API_TOKEN: "gateway-token",
       WORKERS_AI: undefined,
     })).sameAccountGateway).toBeUndefined();
+  });
+});
+
+describe("AiGatewayConfig open models", () => {
+  const QWEN = {
+    id: "qwen3-coder-vertex",
+    name: "Qwen3 Coder 480B (Vertex)",
+    gatewayPath: "google-vertex-ai/v1/projects/p/locations/us-south1/endpoints/openapi",
+    model: "qwen/qwen3-coder-480b-a35b-instruct-maas",
+    contextWindow: 262144,
+    outputLimit: 65536,
+    cost: { input: 0.2, output: 1.62 },
+  };
+
+  // Binding transport with no API token: open models ride the binding like Workers AI.
+  function openEnv(openModels: unknown, providers = "cloudflare,gateway-openai") {
+    return env({
+      CF_AI_GATEWAY_ACCOUNT_ID: "account-id",
+      CF_AI_GATEWAY_PROVIDERS: providers,
+      CF_AI_GATEWAY_OPEN_MODELS:
+          typeof openModels === "string" ? openModels : JSON.stringify(openModels),
+      WORKERS_AI: {} as Ai,
+    });
+  }
+
+  const openIds = (config: AiGatewayConfig) =>
+    config.getModelList().map(model => model.id).filter(id => !id.startsWith("@cf/"));
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("lists and resolves open models without an API token", () => {
+    const config = new AiGatewayConfig(openEnv([QWEN]));
+    expect(config.apiToken).toBeUndefined();
+    expect(config.getModelList()).toContainEqual(
+        { type: "agent", id: "qwen3-coder-vertex", name: "Qwen3 Coder 480B (Vertex)" });
+    // The model id users see maps back to the entry; the config carries no route or key.
+    expect(config.resolveModel("qwen3-coder-vertex")).toEqual({
+      profile: { type: "agent", id: "qwen3-coder-vertex", name: "Qwen3 Coder 480B (Vertex)" },
+      config: { provider: "gateway-openai", model: "qwen3-coder-vertex", apiToken: "" },
+    });
+    expect(config.openModels.get("qwen3-coder-vertex")).toEqual(QWEN);
+  });
+
+  it("offers no open models unless gateway-openai is an enabled provider", () => {
+    const config = new AiGatewayConfig(openEnv([QWEN], "cloudflare"));
+    expect(openIds(config)).toEqual([]);
+    expect(config.resolveModel("qwen3-coder-vertex")).toBeUndefined();
+  });
+
+  it.each(["", "   ", "{not json", "{\"id\": \"x\"}"])(
+      "logs and ignores a malformed CF_AI_GATEWAY_OPEN_MODELS (%j)", (raw) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const config = new AiGatewayConfig(openEnv(raw));
+    expect(openIds(config)).toEqual([]);
+    // The rest of the model list is unaffected.
+    expect(config.getModelList().length).toBeGreaterThan(0);
+    expect(warn).toHaveBeenCalledTimes(raw.trim() === "" ? 0 : 1);
+  });
+
+  it("logs and skips invalid entries while keeping valid ones", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const invalid = [
+      null,
+      { ...QWEN, id: "" },
+      { ...QWEN, id: "no-name", name: undefined },
+      { ...QWEN, id: "no-model", model: 7 },
+      { ...QWEN, id: "zero-window", contextWindow: 0 },
+      { ...QWEN, id: "fractional-output", outputLimit: 1.5 },
+      { ...QWEN, id: "negative-cost", cost: { input: -1, output: 1 } },
+      { ...QWEN, id: "partial-cost", cost: { input: 1 } },
+      ...[
+        "/google-vertex-ai/v1", "google-vertex-ai/v1/", "https://evil.example/v1",
+        "google-vertex-ai//v1", "google-vertex-ai/../workers-ai", "google-vertex-ai/%2e%2e/x",
+        "google-vertex-ai/v1?x=1", "google-vertex-ai/v1#x", "", 42,
+      ].map((gatewayPath, i) => ({ ...QWEN, id: `bad-path-${i}`, gatewayPath })),
+      { ...QWEN, name: "Duplicate" },
+    ];
+    // JSON drops the undefined cost, as a config without one would omit it.
+    const uncosted = { ...QWEN, id: "uncosted", cost: undefined };
+    const config = new AiGatewayConfig(openEnv([QWEN, ...invalid, uncosted]));
+
+    expect(openIds(config)).toEqual(["qwen3-coder-vertex", "uncosted"]);
+    expect(config.openModels.get("qwen3-coder-vertex")?.name).toBe("Qwen3 Coder 480B (Vertex)");
+    expect(config.openModels.get("uncosted")?.cost).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(invalid.length);
+  });
+});
+
+describe("UserDurableObject.addModel", () => {
+  it("rejects user-added open models", async () => {
+    const put = vi.fn();
+    const user = Object.create(UserDurableObject.prototype) as UserDurableObject;
+    Object.assign(user, {
+      env: env({ CF_AI_GATEWAY_ACCOUNT_ID: "account-id",
+        CF_AI_GATEWAY_PROVIDERS: "cloudflare,gateway-openai" }),
+      storage: { aiModels: { put } },
+    });
+
+    await expect(user.addModel(
+        { type: "agent", id: "mine", name: "Mine" },
+        { provider: "gateway-openai", model: "anything", apiToken: "" }))
+        .rejects.toThrow("configured by the deployment");
+    expect(put).not.toHaveBeenCalled();
   });
 });
 

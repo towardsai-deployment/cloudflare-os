@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { AiChatAuthorInfo, AiModelConfig } from "@gadgets/workshop-shared/api";
+import { AiGatewayConfig } from "../src/ai-gateway.js";
 import { getModel, type ModelHandle } from "../src/ai-models.js";
 
 // These tests exercise the real pi-ai stack: no module mocks. Routing decisions are asserted on
@@ -395,6 +396,139 @@ describe("getModel AI Gateway binding transport", () => {
         'Provider "google" cannot use the Workers AI binding transport');
   });
 
+  describe("open models (gateway-openai)", () => {
+    const VERTEX_PATH = "google-vertex-ai/v1/projects/p/locations/us-south1/endpoints/openapi";
+    const QWEN = {
+      id: "qwen3-coder-vertex",
+      name: "Qwen3 Coder 480B (Vertex)",
+      gatewayPath: VERTEX_PATH,
+      model: "qwen/qwen3-coder-480b-a35b-instruct-maas",
+      contextWindow: 262144,
+      outputLimit: 65536,
+      cost: { input: 0.2, output: 1.62 },
+    };
+
+    // No CF_AI_GATEWAY_API_TOKEN: the binding transport alone carries open models.
+    function openEnv(models: object[] = [QWEN]): Cloudflare.Env {
+      return bindingEnv({
+        CF_AI_GATEWAY_PROVIDERS: "cloudflare,gateway-openai",
+        CF_AI_GATEWAY_OPEN_MODELS: JSON.stringify(models),
+      });
+    }
+
+    // The config the model picker resolves to, as getChatContext would produce it.
+    function openConfig(testEnv: Cloudflare.Env, id = QWEN.id): AiModelConfig {
+      return new AiGatewayConfig(testEnv).resolveModel(id)!.config;
+    }
+
+    async function captureOpenEntry(handle: ModelHandle): Promise<CapturedBindingRequest> {
+      const stream = handle.stream(handle.model, {
+        systemPrompt: "You are a coding agent.",
+        messages: [{ role: "user", content: "hello", timestamp: 0 }],
+      }, { maxRetries: 0, maxTokens: 1024 });
+      expect((await stream.result()).stopReason).toBe("error");
+      return capturedEntries[0];
+    }
+
+    it("reaches the gateway's provider route over the binding with no provider auth",
+        async () => {
+      const testEnv = openEnv();
+      const handle = getModel(testEnv, openConfig(testEnv), INITIATOR, {
+        metadata: { source: "chat", gadgetId: "gadget-123", chatId: 7 },
+      });
+
+      expect(handle.model).toMatchObject({
+        api: "openai-completions",
+        id: "qwen/qwen3-coder-480b-a35b-instruct-maas",
+        name: "Qwen3 Coder 480B (Vertex)",
+        baseUrl: `https://workers-binding.ai/ai-gateway/gateways/platform-gateway/${VERTEX_PATH}`,
+        input: ["text"],
+        contextWindow: 262144,
+        maxTokens: 65536,
+        cost: { input: 0.2, output: 1.62, cacheRead: 0, cacheWrite: 0 },
+      });
+      expect(handle.aiGatewayLogRoute).toEqual({ gateway: "platform-gateway" });
+
+      const entry = await captureOpenEntry(handle);
+      expect(entry.url).toBe(
+          "https://workers-binding.ai/ai-gateway/gateways/platform-gateway/google-vertex-ai/v1/" +
+          "projects/p/locations/us-south1/endpoints/openapi/chat/completions");
+      // Only the binding sentinel: no provider key of any kind, so the gateway injects its
+      // stored Vertex credential.
+      expect(entry.headers["cf-aig-authorization"]).toBe("Bearer cloudflare-gateway-binding");
+      const headerNames = Object.keys(entry.headers).map((name) => name.toLowerCase());
+      expect(headerNames).not.toContain("authorization");
+      expect(headerNames).not.toContain("x-api-key");
+      expect(JSON.parse(entry.headers["cf-aig-metadata"])).toEqual({
+        user: "user-123", source: "chat", gadgetId: "gadget-123", chatId: 7,
+      });
+      // Configured prices, converted from USD per 1M tokens to USD per token.
+      expect(JSON.parse(entry.headers["cf-aig-custom-cost"])).toEqual({
+        per_token_in: 0.2 / 1_000_000,
+        per_token_out: 1.62 / 1_000_000,
+      });
+
+      // Nothing OpenAI-only in the body.
+      const body = JSON.parse(entry.body) as Record<string, unknown> & {
+        messages: { role: string }[];
+      };
+      expect(body.model).toBe("qwen/qwen3-coder-480b-a35b-instruct-maas");
+      expect(body.messages.map((message) => message.role)).toEqual(["system", "user"]);
+      expect(body.max_tokens).toBe(1024);
+      expect(body).not.toHaveProperty("max_completion_tokens");
+      expect(body).not.toHaveProperty("store");
+      expect(body).not.toHaveProperty("reasoning_effort");
+    }, 15000);
+
+    it("sends the cache-read price when configured, and no cost header without prices",
+        async () => {
+      const testEnv = openEnv([
+        { ...QWEN, cost: { input: 1, output: 2, cacheRead: 0.1 } },
+        { ...QWEN, id: "uncosted", cost: undefined },
+      ]);
+
+      const costed = await captureOpenEntry(getModel(testEnv, openConfig(testEnv), INITIATOR));
+      expect(JSON.parse(costed.headers["cf-aig-custom-cost"])).toEqual({
+        per_token_in: 1 / 1_000_000,
+        per_token_out: 2 / 1_000_000,
+        per_cache_read_token: 0.1 / 1_000_000,
+      });
+
+      capturedEntries.length = 0;
+      const uncosted = getModel(testEnv, openConfig(testEnv, "uncosted"), INITIATOR);
+      expect(uncosted.model.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+      const entry = await captureOpenEntry(uncosted);
+      expect(Object.keys(entry.headers).map((name) => name.toLowerCase()))
+          .not.toContain("cf-aig-custom-cost");
+    }, 15000);
+
+    it("keeps a connected user's open-model requests on the platform gateway", async () => {
+      // The Vertex key is stored only on the platform gateway, so BYOK routing doesn't apply.
+      const testEnv = openEnv();
+      const handle = getModel(testEnv, openConfig(testEnv), INITIATOR, {
+        userGateway: { accountId: "user-account-id", apiKey: "user-token" },
+      });
+
+      expect(handle.model.baseUrl).toBe(
+          `https://workers-binding.ai/ai-gateway/gateways/platform-gateway/${VERTEX_PATH}`);
+      expect(handle.aiGatewayLogRoute).toEqual({ gateway: "platform-gateway" });
+      const entry = await captureOpenEntry(handle);
+      expect(entry.headers["cf-aig-authorization"]).toBe("Bearer cloudflare-gateway-binding");
+      expect(JSON.stringify(entry.headers)).not.toContain("user-token");
+    }, 15000);
+
+    it("rejects an open model the deployment doesn't declare", () => {
+      expect(() => getModel(openEnv(), {
+        provider: "gateway-openai", model: "unknown", apiToken: "",
+      }, INITIATOR)).toThrow('Provider "gateway-openai" is not supported through AI Gateway');
+    });
+
+    it("is unavailable outside gateway mode", () => {
+      expect(() => getModel(env({ CF_AI_GATEWAY: undefined }), {
+        provider: "gateway-openai", model: QWEN.id, apiToken: "",
+      }, INITIATOR)).toThrow("only available through the deployment's AI Gateway");
+    });
+  });
 });
 
 describe("getModel direct routing (no gateway)", () => {

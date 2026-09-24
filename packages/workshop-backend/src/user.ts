@@ -548,6 +548,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async addModel(profile: AiChatAuthorInfo, config: AiModelConfig): Promise<void> {
+    // Open models are deployment-wide and come only from CF_AI_GATEWAY_OPEN_MODELS.
+    if (config.provider === "gateway-openai") {
+      throw new Error("AI Gateway open models are configured by the deployment, not per user.");
+    }
     let gwConfig = getAiGatewayConfig(this.env);
     if (gwConfig && !gwConfig.providers.has(config.provider)) {
       throw new Error(`Provider "${config.provider}" is not available in AI Gateway mode.`);

@@ -1132,8 +1132,39 @@ export type CloudflareAccountOption = {
   accountName: string;
 };
 
-/** Supported AI providers. */
-export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
+/**
+ * Supported AI providers. `"gateway-openai"` is an OpenAI-compatible model reached at a path on
+ * the deployment's AI Gateway (see {@link OpenModelConfig}); its models come only from deployment
+ * config, never from users.
+ */
+export type AiModelProvider =
+    "openai" | "anthropic" | "google" | "cloudflare" | "ollama" | "gateway-openai";
+
+/**
+ * An org-wide open model served by the deployment's AI Gateway under provider `"gateway-openai"`.
+ * The deployment passes a JSON array of these in the `CF_AI_GATEWAY_OPEN_MODELS` Worker var. The
+ * gateway supplies the provider credential from its stored Provider Keys, so none appears here.
+ */
+export interface OpenModelConfig {
+  /** User-visible model id (the `AiChatAuthorInfo` id and `AiModelConfig.model`). */
+  id: string;
+  /** Display name in the model picker. */
+  name: string;
+  /**
+   * The provider route under the gateway root, with no scheme and no leading or trailing slash,
+   * e.g. `google-vertex-ai/v1/projects/{project}/locations/{region}/endpoints/openapi`. The
+   * OpenAI chat-completions path (`/chat/completions`) is appended to it.
+   */
+  gatewayPath: string;
+  /** The model name sent in the request body, as the provider's API expects it. */
+  model: string;
+  /** Maximum tokens one request may total. */
+  contextWindow: number;
+  /** Maximum response tokens. */
+  outputLimit: number;
+  /** Prices in USD per 1M tokens, sent to the gateway as a custom cost for its logs. */
+  cost?: { input: number; output: number; cacheRead?: number };
+}
 
 /** Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`. */
 export type AiGatewayInfo = {
@@ -1208,6 +1239,9 @@ export const SUGGESTED_MODELS: Record<
     "gemini-3.6-flash": {name: "Gemini 3.6 Flash", contextWindow: 1048576},
   },
   "ollama": {
+  },
+  // Deployment-declared (OpenModelConfig), so nothing is suggested here.
+  "gateway-openai": {
   },
 };
 
