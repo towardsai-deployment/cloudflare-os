@@ -392,6 +392,28 @@ const MAX_CHAT_ATTACHMENT_BYTES = 1024 * 1024;
 const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 5 * 1024 * 1024;
 const MAX_CHAT_ATTACHMENT_SOURCE_IMAGE_BYTES = 25 * 1024 * 1024;
 const CHAT_ATTACHMENT_IMAGE_MAX_EDGE = 1568;
+// Documents the server converts to Markdown at upload may be this large raw; only the converted
+// text is stored, under the server's own cap. The formats mirror CONVERTIBLE_DOCUMENTS in
+// @gadgets/backend-utils/document-formats; the server decides, this only picks the size cap.
+const MAX_CHAT_DOCUMENT_BYTES = 10 * 1024 * 1024;
+const CONVERTIBLE_DOCUMENT_EXTENSIONS = new Set(["pdf", "docx", "xlsx", "xls", "xlsm", "xlsb", "ods", "odt", "numbers"]);
+const CONVERTIBLE_DOCUMENT_MIME_TYPES = new Set([
+  "application/pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.ms-excel",
+  "application/vnd.ms-excel.sheet.macroenabled.12",
+  "application/vnd.ms-excel.sheet.binary.macroenabled.12",
+  "application/vnd.oasis.opendocument.spreadsheet",
+  "application/vnd.oasis.opendocument.text",
+  "application/vnd.apple.numbers",
+]);
+
+function isConvertibleDocument(name: string | undefined, mimeType: string): boolean {
+  if (CONVERTIBLE_DOCUMENT_MIME_TYPES.has(mimeType.toLowerCase())) return true;
+  const dot = name?.lastIndexOf(".") ?? -1;
+  return dot > 0 && CONVERTIBLE_DOCUMENT_EXTENSIONS.has(name!.slice(dot + 1).toLowerCase());
+}
 
 function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number): Promise<Blob> {
   return new Promise((resolve, reject) => {
@@ -401,7 +423,11 @@ function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number)
 
 async function prepareChatAttachment(file: File): Promise<{blob: Blob, mimeType: string}> {
   if (!file.type.startsWith("image/")) {
-    if (file.size > MAX_CHAT_ATTACHMENT_BYTES) {
+    if (isConvertibleDocument(file.name, file.type)) {
+      if (file.size > MAX_CHAT_DOCUMENT_BYTES) {
+        throw new Error(`${file.name} is ${formatAttachmentSize(file.size)}; documents must be ${formatAttachmentSize(MAX_CHAT_DOCUMENT_BYTES)} or smaller.`);
+      }
+    } else if (file.size > MAX_CHAT_ATTACHMENT_BYTES) {
       throw new Error(`Attachments must be ${formatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)} or smaller.`);
     }
     return { blob: file, mimeType: file.type || "application/octet-stream" };
@@ -2273,8 +2299,11 @@ export const ChatInput = ({
         toasts.add({ title: `You can attach up to ${MAX_PENDING_ATTACHMENTS} attachments`, variant: "error" });
         continue;
       }
-      const totalPendingBytes = pendingAttachmentsRef.current.reduce((sum, attachment) => sum + attachment.blob.size, 0);
-      if (totalPendingBytes + blob.size > MAX_CHAT_ATTACHMENT_TOTAL_BYTES) {
+      // Documents are capped one by one instead: only their converted text is stored, and the
+      // server's total check counts stored bytes.
+      const totalPendingBytes = pendingAttachmentsRef.current.reduce((sum, attachment) =>
+        isConvertibleDocument(attachment.name, attachment.mimeType) ? sum : sum + attachment.blob.size, 0);
+      if (!isConvertibleDocument(file.name, mimeType) && totalPendingBytes + blob.size > MAX_CHAT_ATTACHMENT_TOTAL_BYTES) {
         toasts.add({ title: `Attached files must total ${formatAttachmentSize(MAX_CHAT_ATTACHMENT_TOTAL_BYTES)} or less`, variant: "error" });
         continue;
       }
