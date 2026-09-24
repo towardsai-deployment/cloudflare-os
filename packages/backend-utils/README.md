@@ -14,3 +14,9 @@ The optional `@gadgets/backend-utils/error-reporting` entry point dispatches bou
 a private Reporter bound as `ERROR_REPORTER`; `reportIssue(failureSite, caught, options?)` accepts
 ambient fields under `options.attributes`, so callers can spread the context's `.get()` result and
 augment it inline. Reporting is a no-op when the binding is absent.
+
+`@gadgets/backend-utils/document-markdown` converts uploaded or fetched documents (PDF, Word,
+Excel, OpenDocument, Numbers) to Markdown through the Workers AI binding's `toMarkdown()`, with
+embedded-image conversion always off so it stays in the free tier. Its format list and messages
+also live in `@gadgets/backend-utils/document-formats`, which has no Workers types and so can be
+imported by browser bundles.

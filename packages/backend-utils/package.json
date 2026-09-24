@@ -19,6 +19,14 @@
     "./error-reporting": {
       "types": "./src/error-reporting.ts",
       "import": "./src/error-reporting.ts"
+    },
+    "./document-formats": {
+      "types": "./src/document-formats.ts",
+      "import": "./src/document-formats.ts"
+    },
+    "./document-markdown": {
+      "types": "./src/document-markdown.ts",
+      "import": "./src/document-markdown.ts"
     }
   },
   "scripts": {
