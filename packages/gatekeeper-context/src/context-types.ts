@@ -234,6 +234,8 @@ export const MAX_CONVERTED_MARKDOWN_CHARS = 900_000;
  */
 export const UNSUPPORTED_BINARY_EXTENSIONS: ReadonlySet<string> = new Set([
   ...UNSUPPORTED_DOCUMENT_HINTS.keys(),
+  // Keynote files and PEM private keys alike; either way not something to store as text.
+  "key",
   "zip", "gz", "tgz", "tar", "7z", "rar", "exe", "dll", "dmg", "iso",
   "mp3", "mp4", "m4a", "mov", "wav", "avi", "heic", "tif", "tiff",
 ]);

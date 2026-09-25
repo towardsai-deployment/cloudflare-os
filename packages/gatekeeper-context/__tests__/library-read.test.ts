@@ -7,6 +7,7 @@ vi.mock("capnweb-validate", () => ({ validateRpc: () => (target: unknown) => tar
 
 const { LibraryReadSession } = await import("../src/library-read.js");
 type ContextDocument = import("../src/context-types.js").ContextDocument;
+const { MAX_CONVERTED_MARKDOWN_CHARS, MAX_DOCUMENT_BODY_BYTES } = await import("../src/context-types.js");
 
 const PDF_BODY = Buffer.from("%PDF-1.7 legacy").toString("base64");
 const TEXT = "# old.pdf\n\n## Contents\n\nThe onboarding checklist covers laptops, accounts and badges.";
@@ -56,6 +57,39 @@ describe("LibraryReadSession.read of stored binaries", () => {
     expect(result?.content).toBe(
       "[old.pdf is a stored PDF file that couldn't be shown as text. " +
       "Document conversion isn't available on this deployment (Workers AI isn't bound).]");
+  });
+
+  it("cuts converted text at the character cap, with a note saying why", async () => {
+    let { ai } = aiReturning("x".repeat(1_000_000));
+    let session = makeSession(storedDoc("big.pdf", "application/pdf", PDF_BODY), ai);
+
+    let content = (await session.read("c1/big.pdf"))!.content;
+    let [header, body] = content.split("\n\n");
+
+    expect(header).toBe(
+      "> Converted from the stored PDF file big.pdf for reading.\n" +
+      "> Truncated: its text is longer than the 900,000 characters one read returns; this is the start. " +
+      "Split the file and upload the parts to read the rest.");
+    expect(body.length).toBe(MAX_CONVERTED_MARKDOWN_CHARS);
+  });
+
+  it("cuts non-Latin text at the byte cap, on a character boundary", async () => {
+    // Three UTF-8 bytes each: 600,000 characters (under the character cap) are 1.8 MB.
+    let { ai } = aiReturning("\u6f22".repeat(600_000));
+    let session = makeSession(storedDoc("big.pdf", "application/pdf", PDF_BODY), ai);
+
+    let content = (await session.read("c1/big.pdf"))!.content;
+    let body = content.slice(content.indexOf("\n\n") + 2);
+
+    expect(content).toContain("longer than the 1.4 MB one read returns");
+    expect(body).toBe("\u6f22".repeat(Math.floor(MAX_DOCUMENT_BODY_BYTES / 3)));
+  });
+
+  it("leaves text within the caps whole", async () => {
+    let { ai } = aiReturning(TEXT);
+    let session = makeSession(storedDoc("old.pdf", "application/pdf", PDF_BODY), ai);
+
+    expect((await session.read("c1/old.pdf"))!.content).not.toContain("Truncated");
   });
 
   it("still returns images as data: URIs", async () => {

@@ -6,6 +6,7 @@ vi.mock("capnweb-validate", () => ({ validateRpc: () => (target: unknown) => tar
 
 const { ContextApiImpl } = await import("../src/context-api.js");
 const { MAX_CONVERTIBLE_UPLOAD_BYTES } = await import("../src/context-types.js");
+const { base64DecodedLength } = await import("../src/document-conversion.js");
 
 const TEXT = "# report.pdf\n\n## Contents\n\nQuarterly revenue grew by twelve percent across all regions.";
 const PDF_BASE64 = Buffer.from("%PDF-1.7 test").toString("base64");
@@ -17,15 +18,16 @@ function aiReturning(data: string) {
   return { ai: { toMarkdown } as unknown as Ai, toMarkdown };
 }
 
-// Fake namespaces: this account owns every collection it asks about, and nothing is public.
-function makeApi(ai: Ai | undefined, { owns = true } = {}) {
+// Fake namespaces. By default this account owns every collection it asks about and nothing is
+// public; `owns: false, isPublic: true` models a public collection.
+function makeApi(ai: Ai | undefined, { owns = true, isPublic = false, isAdmin = false } = {}) {
   let putContextDocument = vi.fn(async () => {});
   let namespace = (stub: object) => ({ idFromName: (name: string) => name, get: () => stub });
   let api = new ContextApiImpl(
-    { WORKERS_AI: ai } as unknown as Cloudflare.Env, "workshop.example", "account-1", false,
+    { WORKERS_AI: ai } as unknown as Cloudflare.Env, "workshop.example", "account-1", isAdmin,
     namespace({ putContextDocument }) as never,
     namespace({ hasOwned: async () => owns }) as never,
-    { getByName: () => ({ isPublic: async () => false }) } as never,
+    { getByName: () => ({ isPublic: async () => isPublic }) } as never,
   );
   return { api, putContextDocument };
 }
@@ -63,7 +65,7 @@ describe("ContextApiImpl.importContextDocument", () => {
   it("rejects an upload over the raw cap before converting", async () => {
     let { ai, toMarkdown } = aiReturning(TEXT);
     let { api, putContextDocument } = makeApi(ai);
-    let base64 = "A".repeat(Math.ceil((MAX_CONVERTIBLE_UPLOAD_BYTES + 2 * 1024 * 1024) * 4 / 3));
+    let base64 = "A".repeat((MAX_CONVERTIBLE_UPLOAD_BYTES + 2 * 1024 * 1024) / 3 * 4);
 
     await expect(api.importContextDocument("c1", "big.pdf", { base64 }))
       .rejects.toThrow("big.pdf is 12 MB; documents must be 10 MB or smaller.");
@@ -97,12 +99,68 @@ describe("ContextApiImpl.importContextDocument", () => {
     expect(putContextDocument).not.toHaveBeenCalled();
   });
 
-  it("rejects converted text over the stored-size cap", async () => {
+  it("accepts exactly 10 MiB and rejects one byte more, agreeing with the browser's File.size", async () => {
+    let { ai, toMarkdown } = aiReturning(TEXT);
+    let { api } = makeApi(ai);
+    // Lengths not divisible by 3, so the base64 carries "=" or "==" padding.
+    for (let extra of [0, 1, 2]) {
+      let base64 = Buffer.alloc(MAX_CONVERTIBLE_UPLOAD_BYTES - extra).toString("base64");
+      expect(base64DecodedLength(base64)).toBe(MAX_CONVERTIBLE_UPLOAD_BYTES - extra);
+    }
+    let atCap = Buffer.alloc(MAX_CONVERTIBLE_UPLOAD_BYTES).toString("base64");
+    await expect(api.importContextDocument("c1", "exact.pdf", { base64: atCap }))
+      .resolves.toEqual({ path: "exact.pdf.md" });
+
+    let overCap = Buffer.alloc(MAX_CONVERTIBLE_UPLOAD_BYTES + 1).toString("base64");
+    await expect(api.importContextDocument("c1", "over.pdf", { base64: overCap }))
+      .rejects.toThrow("over.pdf is 10.1 MB; documents must be 10 MB or smaller.");
+    expect(toMarkdown).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects converted text over the character cap, in characters", async () => {
     let { ai } = aiReturning("x".repeat(1_000_000));
     let { api } = makeApi(ai);
 
+    await expect(api.importContextDocument("c1", "report.pdf", { base64: PDF_BASE64 })).rejects.toThrow(
+      "report.pdf converts to 1,000,000 characters of text; the limit is 900,000 characters. " +
+      "Split it or upload only the pages you need.");
+  });
+
+  it("rejects non-Latin text under the character cap but over the byte cap", async () => {
+    // 500,000 CJK characters are 1,500,000 UTF-8 bytes: within 900,000 characters, over 1.4 MB.
+    let { ai } = aiReturning("\u6f22".repeat(500_000));
+    let { api, putContextDocument } = makeApi(ai);
+
+    await expect(api.importContextDocument("c1", "report.pdf", { base64: PDF_BASE64 })).rejects.toThrow(
+      "report.pdf converts to 1.5 MB of text; the limit is 1.4 MB. Split it or upload only the pages you need.");
+    expect(putContextDocument).not.toHaveBeenCalled();
+  });
+
+  it("lets an admin import into a public collection", async () => {
+    let { ai } = aiReturning(TEXT);
+    let { api, putContextDocument } = makeApi(ai, { owns: false, isPublic: true, isAdmin: true });
+
     await expect(api.importContextDocument("c1", "report.pdf", { base64: PDF_BASE64 }))
-      .rejects.toThrow("report.pdf converts to 977 KB of text; the limit is 879 KB. Split it or upload only the pages you need.");
+      .resolves.toEqual({ path: "report.pdf.md" });
+    expect(putContextDocument).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a non-admin importing into a public collection", async () => {
+    let { ai, toMarkdown } = aiReturning(TEXT);
+    let { api, putContextDocument } = makeApi(ai, { owns: false, isPublic: true, isAdmin: false });
+
+    await expect(api.importContextDocument("c1", "report.pdf", { base64: PDF_BASE64 }))
+      .rejects.toThrow("Collection not found or you don't have access.");
+    expect(toMarkdown).not.toHaveBeenCalled();
+    expect(putContextDocument).not.toHaveBeenCalled();
+  });
+
+  it("gives .key files the generic message, not a Keynote hint", async () => {
+    let { ai } = aiReturning(TEXT);
+    let { api } = makeApi(ai);
+
+    await expect(api.importContextDocument("c1", "certs/server.key", { base64: PDF_BASE64 }))
+      .rejects.toThrow(/^Unsupported file type \(\.key\)\./);
   });
 
   it("checks write access before converting", async () => {
