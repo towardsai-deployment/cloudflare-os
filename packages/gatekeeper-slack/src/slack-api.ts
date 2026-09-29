@@ -1,4 +1,4 @@
-// Slack Web API client for user-token reads and OAuth lifecycle. Maps responses to public types and
+// Slack Web API client for user-token reads, approved posts, and OAuth lifecycle. Maps responses to public types and
 // resolves known mentions.
 
 import { AccountDescription } from "@gadgets/workshop-shared/gatekeeper";
@@ -251,6 +251,8 @@ const SLACK_ERROR_MESSAGES: Record<string, string> = {
   token_revoked: "Slack authentication has expired. Please reconnect the account.",
   account_inactive: "Slack authentication has expired. Please reconnect the account.",
   ratelimited: "Slack rate limit reached. Please try again shortly.",
+  restricted_action: "Slack's workspace settings don't allow this user to post there.",
+  msg_too_long: "The Slack message is too long.",
 };
 
 // Slack error codes indicating the token's user cannot see the requested resource (vs. a transient
@@ -337,16 +339,29 @@ export class SlackApi {
 
   // ── Low-level request helper ──────────────────────────────────────
 
+  // Reads send their parameters in the query string. Writes (`post`) send them form-encoded in the
+  // body, which keeps message text out of URLs.
   async #call<T extends SlackApiEnvelope>(
-      method: string, params: Record<string, string | number | undefined>): Promise<T> {
+      method: string, params: Record<string, string | number | undefined>,
+      options: { post?: boolean } = {}): Promise<T> {
     let url = new URL(`${SLACK_API_BASE}/${method}`);
+    let fields = new URLSearchParams();
     for (let [key, value] of Object.entries(params)) {
-      if (value !== undefined) url.searchParams.set(key, String(value));
+      if (value !== undefined) fields.set(key, String(value));
     }
+    if (!options.post) url.search = fields.toString();
 
     for (let attempt = 0; ; attempt++) {
       let token = await this.#getToken();
-      let response = await fetch(url.toString(), {
+      // A 429 means Slack did not act on the request, so retrying a write cannot post twice.
+      let response = await fetch(url.toString(), options.post ? {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: fields,
+      } : {
         headers: { "Authorization": `Bearer ${token}` },
       });
 
@@ -485,6 +500,24 @@ export class SlackApi {
         "conversations.replies", { channel: conversationId, ts: threadTs, cursor, limit });
     let items = await this.#withPermalinks(conversationId, await this.#buildMessages(data.messages ?? []));
     return { items, nextCursor: nextCursor(data) };
+  }
+
+  // ── Writes (called only from applyAction, after approval) ─────────
+
+  /** Posts `text` as the token's user, in a thread when `threadTs` is set. */
+  async postMessage(conversationId: string, text: string, threadTs?: string)
+      : Promise<{ channelId: string; ts: string }> {
+    let data = await this.#call<SlackApiEnvelope & { channel?: string; ts?: string }>(
+        "chat.postMessage", { channel: conversationId, text, thread_ts: threadTs }, { post: true });
+    return { channelId: data.channel ?? conversationId, ts: data.ts ?? "" };
+  }
+
+  /** Opens (or finds) the DM or group DM with the given users, returning its conversation ID. */
+  async openConversation(userIds: string[]): Promise<string> {
+    let data = await this.#call<SlackApiEnvelope & { channel?: { id?: string } }>(
+        "conversations.open", { users: userIds.join(",") }, { post: true });
+    if (!data.channel?.id) throw new Error("Slack did not return the opened conversation.");
+    return data.channel.id;
   }
 
   // ── Search ────────────────────────────────────────────────────────
