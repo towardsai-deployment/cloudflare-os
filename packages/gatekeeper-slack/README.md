@@ -52,7 +52,9 @@ and thread URLs take precedence. Channels and DMs share one "Conversation" grant
 where the conversation read scopes are `channels`/`groups`/`im`/`mpim` `:read` + `:history`.
 `chat:write` posts; `im:write` and `mpim:write` let `conversations.open` start a DM or group DM,
 which only whole-workspace grants can do. A resource counts as granted only when all its scopes
-were, so a connection made before the write scopes existed is asked to reconnect. The scope tables
+were, so a connection made before the write scopes existed shows no resources as granted until one
+is granted again, which asks Slack for the missing scopes (`ensureResources`). `reconnect()` alone
+doesn't restore it. The scope tables
 are in `src/slack-scopes.ts`.
 
 ## API
@@ -74,14 +76,17 @@ names.
 (non-empty text of at most 40,000 characters; 1–8 distinct user IDs for a DM), stores the action
 in the gatekeeper's own storage, and submits it to the approval queue (`src/slack-actions.ts`).
 `applyAction` makes the Slack calls only after approval — `chat.postMessage`, preceded by
-`conversations.open` for a new DM — and never posts the same action twice.
+`conversations.open` for a new DM. An action being applied is claimed in storage first, so two
+overlapping approvals can't post it twice; a failed attempt can be retried. Once posted, only where
+it was posted is kept, not the text.
 
 - **Grant scope.** A conversation grant posts only to its conversation and replies only to threads
   in it; a thread grant replies only to its thread, at the resolved root; only a whole-workspace
   grant can send DMs. The destination is fixed when the action is queued.
 - **Approval text.** The destination's name and ID (for example `#general (C0123ABCD)`, or each DM
-  recipient as `Jane Doe (@jane, U0123ABCD)`), the thread's root timestamp for a reply, who posts,
-  and the full text in a code fence the text can't close. It includes no other Slack content, since
+  recipient as `Jane Doe (@jane, U0123ABCD)`), shown as inline code so Markdown in a profile name
+  can't restyle it; the thread's root timestamp for a reply; who posts; and the full text in a code
+  fence the text can't close. It includes no other Slack content, since
   the action log is visible to collaborators who may not be able to read the conversation.
 - **No simulation, auto-approval, or revert.** Pending posts don't appear in later reads, so each
   action sets `awaitDecision`. No action kind is auto-approvable. Undoing a post would need

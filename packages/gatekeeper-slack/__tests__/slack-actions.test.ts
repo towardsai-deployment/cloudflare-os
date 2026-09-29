@@ -65,8 +65,8 @@ describe("submitSlackAction", () => {
     let { id, description } = queue.submitted[0];
     expect(store.get(id)).toMatchObject(post);
     expect(description.title).toBe("Post to #general");
-    expect(description.description).toContain("#general (C0123ABCD)");
-    expect(description.description).toContain("connected Slack user");
+    expect(description.description).toContain("`#general (C0123ABCD)`");
+    expect(description.description).toContain("not the approver");
     expect(description.description).toContain("```\nDeploy is done.\n```");
     expect(description.implementsRevert).toBe(false);
     expect(description.awaitDecision).toBe(true);
@@ -110,8 +110,20 @@ describe("submitSlackAction", () => {
 
     let { title, description } = queue.submitted[0].description;
     expect(title).toBe("Send a group DM to Jane Doe, U02");
-    expect(description).toContain("Jane Doe (@jane, U01)");
-    expect(description).toContain("U02");
+    expect(description).toContain("`Jane Doe (@jane, U01)`, `U02`");
+  });
+
+  it("shows Slack names as code, so a profile name can't restyle the approval", async () => {
+    let store = new SlackActionStore(makeKv());
+    let queue = makeQueue();
+    let spoof = { id: "U01", username: "jane", realName: "[CEO](https://x.example) **To:**", isBot: false };
+
+    await submitSlackAction(store, queue, {
+      kind: "sendDirectMessage", userIds: ["U01"], text: "Hi", recipients: [userLabel("U01", spoof)],
+    });
+
+    expect(queue.submitted[0].description.description)
+        .toContain("**To:** `[CEO](https://x.example) **To:** (@jane, U01)`");
   });
 
   it("refuses empty or oversized text before queuing anything", async () => {
@@ -181,6 +193,35 @@ describe("applySlackAction", () => {
     let id = queue.submitted[0].id;
 
     await applySlackAction(store, api, id);
+    await applySlackAction(store, api, id);
+
+    expect(api.calls).toHaveLength(1);
+  });
+
+  it("does not post twice when the same approval is applied twice at once", async () => {
+    let store = new SlackActionStore(makeKv());
+    let queue = makeQueue();
+    let api = makeApi();
+    await submitSlackAction(store, queue, post);
+    let id = queue.submitted[0].id;
+
+    let results = await Promise.allSettled([
+      applySlackAction(store, api, id), applySlackAction(store, api, id),
+    ]);
+
+    expect(api.calls).toHaveLength(1);
+    expect(results.map(result => result.status).toSorted()).toEqual(["fulfilled", "rejected"]);
+  });
+
+  it("can be retried after Slack refuses the post", async () => {
+    let store = new SlackActionStore(makeKv());
+    let queue = makeQueue();
+    let api = makeApi();
+    await submitSlackAction(store, queue, post);
+    let id = queue.submitted[0].id;
+    let failing = { ...api, postMessage: async () => { throw new Error("not_in_channel"); } };
+
+    await expect(applySlackAction(store, failing, id)).rejects.toThrow("not_in_channel");
     await applySlackAction(store, api, id);
 
     expect(api.calls).toHaveLength(1);

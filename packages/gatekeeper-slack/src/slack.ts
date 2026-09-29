@@ -24,7 +24,7 @@ import {
 } from "./slack-scopes";
 import {
   SlackActionStore, SlackPostAction, applySlackAction, conversationDestination, rejectSlackAction,
-  submitSlackAction, userLabel, validatePostText, validateRecipients,
+  submitSlackAction, userLabel, validateRecipients,
 } from "./slack-actions";
 import TYPES_CODE from "./types.txt";
 import WORKSPACE_CONFIGURATOR_HTML from "./generated/workspace-configurator-ui.txt";
@@ -711,10 +711,13 @@ function conversationLabel(info: SlackConversationInfo): string {
   return info.name ? `#${info.name}` : "a private channel";
 }
 
-// The approver-facing destination for a post. A failed lookup (a thread grant has no :read scopes,
-// for example) falls back to the bare ID rather than blocking the request.
+// The approver-facing destination for a post. A lookup the grant can't make (a thread grant has no
+// :read scopes, for example) falls back to the bare ID; any other failure stops the request.
 async function describeDestination(api: SlackApi, conversationId: string) {
-  let info = await api.getConversationInfo(conversationId).catch(() => undefined);
+  let info = await api.getConversationInfo(conversationId).catch((error: unknown) => {
+    if (error instanceof SlackApiError && error.isAccessError) return undefined;
+    throw error;
+  });
   return conversationDestination(conversationId, info);
 }
 
@@ -1226,7 +1229,6 @@ class SlackWorkspaceSessionImpl extends RpcTarget implements SlackWorkspaceSessi
   // is opened for a request nobody approves. Unknown users fail here, before anything is queued.
   async sendDirectMessage(userIds: string[], text: string): Promise<void> {
     validateRecipients(userIds);
-    validatePostText(text);
     let users = await mapWithConcurrency(userIds, id => this.#ctx.api.getUser(id));
     await this.#ctx.submitPost(this.#ctx.approvalQueue, {
       kind: "sendDirectMessage", userIds, text,
@@ -1314,7 +1316,6 @@ class SlackConversationImpl extends RpcTarget implements SlackConversation {
 
   // Posts only to this conversation. The name is for the approver; the ID is what is posted to.
   async postMessage(text: string): Promise<void> {
-    validatePostText(text);
     await this.#ctx.submitPost(this.#ctx.approvalQueue, {
       kind: "postMessage", conversationId: this.#conversationId, text,
       destination: await describeDestination(this.#ctx.api, this.#conversationId),
@@ -1386,7 +1387,6 @@ class SlackThreadImpl extends RpcTarget implements SlackThread {
 
   // Replies only in this thread, at its resolved root, and only once the root can be read.
   async reply(text: string): Promise<void> {
-    validatePostText(text);
     let { rootTs, root } = await this.#resolveRoot();
     if (!root) throw new Error(`Thread ${this.#threadTs} not found.`);
     await this.#ctx.submitPost(this.#ctx.approvalQueue, {

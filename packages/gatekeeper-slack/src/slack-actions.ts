@@ -35,11 +35,11 @@ export type SlackPostAction =
     text: string;
   };
 
-/** A stored action, with where it was posted once applied. */
-export type StoredSlackAction = SlackPostAction & {
-  id: number;
-  posted?: { channelId: string; ts: string };
-};
+/** A stored action waiting for approval. */
+export type StoredSlackAction = SlackPostAction & { id: number };
+
+/** Where an applied action was posted. */
+export type SlackPosted = { channelId: string; ts: string };
 
 /** The slice of Durable Object KV storage the store uses. */
 export interface ActionKv {
@@ -79,9 +79,34 @@ export class SlackActionStore {
     this.#kv.put(`action:${action.id}`, action);
   }
 
-  /** Forgets an action. */
+  /** Forgets an action, and any interrupted attempt to apply it. */
   remove(id: number): void {
     this.#kv.delete(`action:${id}`);
+    this.#kv.delete(`applying:${id}`);
+  }
+
+  /** Where the action was posted, once it has been applied. */
+  posted(id: number): SlackPosted | undefined {
+    return this.#kv.get<SlackPosted>(`posted:${id}`);
+  }
+
+  /** Claims the action for applying; false when another attempt holds it. Storage reads and writes
+   *  are synchronous, so two overlapping calls can't both claim it. */
+  beginApply(id: number): boolean {
+    if (this.#kv.get<boolean>(`applying:${id}`)) return false;
+    this.#kv.put(`applying:${id}`, true);
+    return true;
+  }
+
+  /** Releases a failed attempt so it can be retried. */
+  abortApply(id: number): void {
+    this.#kv.delete(`applying:${id}`);
+  }
+
+  /** Records where the action was posted, and drops its text. */
+  finishApply(id: number, posted: SlackPosted): void {
+    this.#kv.put(`posted:${id}`, posted);
+    this.remove(id);
   }
 }
 
@@ -111,7 +136,7 @@ export function conversationDestination(
 }
 
 /** Checks a post's text: non-empty and within Slack's limit. */
-export function validatePostText(text: string): void {
+function validatePostText(text: string): void {
   if (typeof text !== "string" || text.trim().length === 0) {
     throw new Error("Slack message text must not be empty.");
   }
@@ -141,15 +166,26 @@ export function validateSlackAction(action: SlackPostAction): void {
   if (action.kind === "sendDirectMessage") validateRecipients(action.userIds);
 }
 
+function longestBacktickRun(text: string): number {
+  return Math.max(0, ...[...text.matchAll(/`+/g)].map(match => match[0].length));
+}
+
 // A fence longer than any backtick run in the text, so the text can't close it early.
 function fenced(text: string): string {
-  let longest = Math.max(0, ...[...text.matchAll(/`+/g)].map(match => match[0].length));
-  let fence = "`".repeat(Math.max(3, longest + 1));
+  let fence = "`".repeat(Math.max(3, longestBacktickRun(text) + 1));
   return `${fence}\n${text}\n${fence}`;
 }
 
-const POSTS_AS =
-    "**Posts as:** the connected Slack user whose connection this workspace uses, not the approver.";
+// Names and labels come partly from Slack profiles, which anyone in the workspace can edit, so they
+// are shown as inline code: Markdown in a name can't add links, emphasis or fake fields.
+function code(text: string): string {
+  let flat = text.replace(/\s+/g, " ").trim();
+  let fence = "`".repeat(longestBacktickRun(flat) + 1);
+  let pad = flat.startsWith("`") || flat.endsWith("`") ? " " : "";
+  return `${fence}${pad}${flat}${pad}${fence}`;
+}
+
+const POSTS_AS = "**Posts as:** the Slack account this connection was made with, not the approver.";
 
 /** The approval-queue description for a post. */
 export function describeSlackAction(action: SlackPostAction): ActionDescription {
@@ -160,21 +196,21 @@ export function describeSlackAction(action: SlackPostAction): ActionDescription 
     let group = action.recipients.length > 1;
     title = group ? `Send a group DM to ${names}` : `Send a direct message to ${names}`;
     lines = [
-      `**To:** ${action.recipients.map(recipient => recipient.label).join(", ")}`,
+      `**To:** ${action.recipients.map(recipient => code(recipient.label)).join(", ")}`,
       `Opens the ${group ? "group DM" : "direct message"} with ${group ? "these people" : "this person"}` +
           " (or finds the existing one), then posts to it.",
     ];
   } else if (action.threadTs) {
     title = `Reply in a thread in ${action.destination.name}`;
     lines = [
-      `**Destination:** ${action.destination.label}`,
+      `**Destination:** ${code(action.destination.label)}`,
       // No excerpt of the root: the action log is visible to collaborators who may not be able to
       // read this conversation, so the description carries no content beyond the post itself.
       `**Thread:** a reply to the message sent at \`${action.threadTs}\`.`,
     ];
   } else {
     title = `Post to ${action.destination.name}`;
-    lines = [`**Destination:** ${action.destination.label}`];
+    lines = [`**Destination:** ${code(action.destination.label)}`];
   }
   return {
     title,
@@ -200,19 +236,29 @@ export async function submitSlackAction(
   }
 }
 
-/** Performs an approved post, once: an action already posted is not posted again. */
+/** Performs an approved post, once: an action already posted, or being posted, is not posted
+ *  again. A failed attempt can be retried. */
 export async function applySlackAction(
     store: SlackActionStore, api: Pick<SlackApi, "openConversation" | "postMessage">,
     id: number): Promise<void> {
+  if (store.posted(id)) return;
   let action = store.get(id);
   if (!action) throw new Error(`Unknown action: ${id}`);
-  if (action.posted) return;
-  let channelId = action.kind === "sendDirectMessage"
-      ? await api.openConversation(action.userIds)
-      : action.conversationId;
-  let threadTs = action.kind === "postMessage" ? action.threadTs : undefined;
-  action.posted = await api.postMessage(channelId, action.text, threadTs);
-  store.put(action);
+  if (!store.beginApply(id)) {
+    throw new Error(
+        "This Slack post is already being sent, or an earlier attempt stopped part-way. Check " +
+        "Slack before discarding it.");
+  }
+  try {
+    let channelId = action.kind === "sendDirectMessage"
+        ? await api.openConversation(action.userIds)
+        : action.conversationId;
+    let threadTs = action.kind === "postMessage" ? action.threadTs : undefined;
+    store.finishApply(id, await api.postMessage(channelId, action.text, threadTs));
+  } catch (error) {
+    store.abortApply(id);
+    throw error;
+  }
 }
 
 /** Drops a rejected post. Nothing was simulated, so no restart is needed. */
