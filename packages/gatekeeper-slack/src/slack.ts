@@ -18,6 +18,10 @@ import {
 import {
   ConversationConfiguratorUI, ThreadConfiguratorUI, WorkspaceConfiguratorUI,
 } from "./slack-configurators";
+import {
+  CONVERSATION_RESOURCE, SUPPORTED_RESOURCES, THREAD_RESOURCE, WORKSPACE_RESOURCE,
+  grantedResourcesFromScopes, resourceUrlPatternsToScopes,
+} from "./slack-scopes";
 import TYPES_CODE from "./types.txt";
 import WORKSPACE_CONFIGURATOR_HTML from "./generated/workspace-configurator-ui.txt";
 import CONVERSATION_CONFIGURATOR_HTML from "./generated/conversation-configurator-ui.txt";
@@ -95,88 +99,6 @@ async function mapWithConcurrency<T, R>(
     results.push(...await Promise.all(items.slice(i, i + limit).map(fn)));
   }
   return results;
-}
-
-// ── Resource types & OAuth scopes ───────────────────────────────────
-
-// Needed for account display and user-name resolution.
-const IDENTITY_SCOPES = ["users:read"];
-
-// `https://*` denotes account-wide access; the configurator resolves the concrete workspace URL.
-const WORKSPACE_RESOURCE: SupportedResource = {
-  urlPattern: "https://*",
-  title: "Slack Workspace",
-  description:
-      "Read channels, direct messages, members, and search across the whole connected workspace. " +
-      "The workspace is auto-detected from the connected account — no URL or ID need be supplied.",
-  grantable: true,
-};
-
-const CONVERSATION_RESOURCE: SupportedResource = {
-  urlPattern: "https://app.slack.com/client/:teamId/:conversationId",
-  title: "Slack Conversation",
-  description: "Read a single channel, direct message, or group DM.",
-  grantable: true,
-};
-
-const THREAD_RESOURCE: SupportedResource = {
-  urlPattern: "https://*.slack.com/archives/:conversationId/:messageId",
-  title: "Slack Thread",
-  description: "Read a single message thread and its replies.",
-  grantable: true,
-};
-
-const CONVERSATION_READ_SCOPES = [
-  "channels:read", "channels:history",
-  "groups:read", "groups:history",
-  "im:read", "im:history",
-  "mpim:read", "mpim:history",
-];
-
-const RESOURCE_SCOPES: { resource: SupportedResource; scopes: string[] }[] = [
-  {
-    resource: WORKSPACE_RESOURCE,
-    scopes: ["team:read", ...CONVERSATION_READ_SCOPES, "search:read"],
-  },
-  {
-    resource: CONVERSATION_RESOURCE,
-    scopes: [...CONVERSATION_READ_SCOPES, "search:read"],
-  },
-  {
-    resource: THREAD_RESOURCE,
-    scopes: ["channels:history", "groups:history", "im:history", "mpim:history"],
-  },
-];
-
-const SUPPORTED_RESOURCES: SupportedResource[] = RESOURCE_SCOPES.map(entry => entry.resource);
-
-function validateResourceUrlPatterns(resourceUrlPatterns?: string[]): void {
-  if (resourceUrlPatterns === undefined) return;
-  let known = new Set(RESOURCE_SCOPES.map(entry => entry.resource.urlPattern));
-  let unknown = resourceUrlPatterns.filter(pattern => !known.has(pattern));
-  if (unknown.length > 0) {
-    throw new Error(`Unknown grantable resource URL pattern(s): ${unknown.join(", ")}`);
-  }
-}
-
-function resourceUrlPatternsToScopes(resourceUrlPatterns?: string[]): string[] {
-  validateResourceUrlPatterns(resourceUrlPatterns);
-  let scopes = new Set<string>(IDENTITY_SCOPES);
-  for (let entry of RESOURCE_SCOPES) {
-    if (resourceUrlPatterns === undefined ||
-        resourceUrlPatterns.includes(entry.resource.urlPattern)) {
-      for (let scope of entry.scopes) scopes.add(scope);
-    }
-  }
-  return [...scopes];
-}
-
-function grantedResourcesFromScopes(grantedScopes: string[]): string[] {
-  let granted = new Set(grantedScopes);
-  // Expose a resource only when every required Slack scope was granted.
-  return RESOURCE_SCOPES
-      .filter(entry => entry.scopes.every(scope => granted.has(scope)))
-      .map(entry => entry.resource.urlPattern);
 }
 
 const SLACK_LOGO_URL = `data:image/svg+xml,${encodeURIComponent(SLACK_LOGO_SVG)}`;
