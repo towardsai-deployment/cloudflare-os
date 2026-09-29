@@ -117,8 +117,10 @@ export type SlackMessageEntry = {
 // ── Capability interfaces ───────────────────────────────────────────
 
 /**
- * A session bound to an entire Slack workspace. Provides read-only access to the channels and
- * direct messages the connected user can see, the workspace's users, and message search.
+ * A session bound to an entire Slack workspace. Provides read access to the channels and direct
+ * messages the connected user can see, the workspace's users, and message search, and can ask to
+ * send new direct messages. Every post needs a person's approval and is made as the connected
+ * Slack user (the account this connection was made with, whoever approves it).
  */
 export interface SlackWorkspaceSession {
   /** Get basic workspace metadata (team ID, name, domain). */
@@ -144,11 +146,19 @@ export interface SlackWorkspaceSession {
    *  "from:@bob in:#engineering budget"). The query must be non-empty and at most 1,000 UTF-8
    *  bytes. */
   search(query: string): Promise<Cursor<SlackMessageEntry>>;
+
+  /** Ask to send `text` in a direct message to one user, or in a group DM to 2–8 users, by Slack
+   *  user ID (the DM is opened, or the existing one found, only once approved). Resolves once the
+   *  request is queued for approval: nothing is sent unless a person approves it, and later reads
+   *  don't show it until then. Text uses Slack's mrkdwn, must be non-empty and at most 40,000
+   *  characters. Posts as the connected user. */
+  sendDirectMessage(userIds: string[], text: string): Promise<void>;
 }
 
 /**
- * A session bound to a single conversation — a channel, a DM, or a group DM. Provides read-only
- * access to that conversation's messages, threads, and members.
+ * A session bound to a single conversation — a channel, a DM, or a group DM. Provides read access
+ * to that conversation's messages, threads, and members, and can ask to post in it. Every post
+ * needs a person's approval and is made as the connected Slack user.
  */
 export interface SlackConversation {
   /** Get metadata about this conversation (kind, name, topic, member count, ...). */
@@ -171,10 +181,18 @@ export interface SlackConversation {
    *  to this conversation regardless of the query (any `in:` qualifier the caller supplies cannot
    *  broaden it). The query must be non-empty and at most 1,000 UTF-8 bytes. */
   search(query: string): Promise<Cursor<SlackMessageEntry>>;
+
+  /** Ask to post `text` in this conversation (not in a thread; use `SlackThread.reply()` for that).
+   *  Resolves once the request is queued for approval: nothing is posted unless a person approves
+   *  it, and later reads don't show it until then. Text uses Slack's mrkdwn, must be non-empty and
+   *  at most 40,000 characters. Posts as the connected user. */
+  postMessage(text: string): Promise<void>;
 }
 
 /**
- * A session bound to a single thread within a conversation: the root message and its replies.
+ * A session bound to a single thread within a conversation: the root message and its replies. Can
+ * ask to reply in the thread; every reply needs a person's approval and is made as the connected
+ * Slack user.
  */
 export interface SlackThread {
   /** Get the thread's root (parent) message. */
@@ -182,4 +200,10 @@ export interface SlackThread {
 
   /** List up to 1,000 thread messages, oldest first, including the root as the first element. */
   listReplies(): Promise<SlackMessage[]>;
+
+  /** Ask to post `text` as a reply in this thread. Resolves once the request is queued for approval:
+   *  nothing is posted unless a person approves it, and later reads don't show it until then. Text
+   *  uses Slack's mrkdwn, must be non-empty and at most 40,000 characters. Posts as the connected
+   *  user. */
+  reply(text: string): Promise<void>;
 }

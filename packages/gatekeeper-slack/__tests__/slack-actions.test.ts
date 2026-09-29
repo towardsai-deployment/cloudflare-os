@@ -48,6 +48,12 @@ const post: SlackPostAction = {
   text: "Deploy is done.",
 };
 
+function dm(userIds: string[]): SlackPostAction {
+  return {
+    kind: "sendDirectMessage", userIds, text: "Hi", recipients: userIds.map(id => userLabel(id)),
+  };
+}
+
 describe("submitSlackAction", () => {
   it("queues a post with its destination, author and full text for approval", async () => {
     let store = new SlackActionStore(makeKv());
@@ -82,14 +88,12 @@ describe("submitSlackAction", () => {
     let store = new SlackActionStore(makeKv());
     let queue = makeQueue();
 
-    await submitSlackAction(store, queue, {
-      ...post, threadTs: "1700000000.000100", threadExcerpt: "Is the deploy done?",
-    });
+    await submitSlackAction(store, queue, { ...post, threadTs: "1700000000.000100" });
 
     let { title, description } = queue.submitted[0].description;
     expect(title).toBe("Reply in a thread in #general");
+    expect(description).toContain("#general (C0123ABCD)");
     expect(description).toContain("1700000000.000100");
-    expect(description).toContain("Is the deploy done?");
   });
 
   it("names every recipient of a new group DM with their IDs", async () => {
@@ -124,9 +128,6 @@ describe("submitSlackAction", () => {
   it("refuses a DM to no one, to more than eight people, or to a malformed ID", async () => {
     let store = new SlackActionStore(makeKv());
     let queue = makeQueue();
-    let dm = (userIds: string[]): SlackPostAction => ({
-      kind: "sendDirectMessage", userIds, text: "Hi", recipients: userIds.map(id => userLabel(id)),
-    });
 
     await expect(submitSlackAction(store, queue, dm([]))).rejects.toThrow("1 to 8");
     await expect(submitSlackAction(store, queue, dm(

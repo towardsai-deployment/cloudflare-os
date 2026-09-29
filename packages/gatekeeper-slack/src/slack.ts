@@ -22,6 +22,10 @@ import {
   CONVERSATION_RESOURCE, SUPPORTED_RESOURCES, THREAD_RESOURCE, WORKSPACE_RESOURCE,
   grantedResourcesFromScopes, resourceUrlPatternsToScopes,
 } from "./slack-scopes";
+import {
+  SlackActionStore, SlackPostAction, applySlackAction, conversationDestination, rejectSlackAction,
+  submitSlackAction, userLabel, validatePostText, validateRecipients,
+} from "./slack-actions";
 import TYPES_CODE from "./types.txt";
 import WORKSPACE_CONFIGURATOR_HTML from "./generated/workspace-configurator-ui.txt";
 import CONVERSATION_CONFIGURATOR_HTML from "./generated/conversation-configurator-ui.txt";
@@ -166,7 +170,7 @@ export default {
       let authUrl = new URL("https://slack.com/oauth/v2/authorize");
       authUrl.searchParams.set("client_id", env.CLIENT_ID);
       authUrl.searchParams.set("redirect_uri", getBaseUrl(env) + "/oauth");
-      // User scopes produce the read-only user token needed for private channels and DMs.
+      // User scopes produce a user token, which sees private channels and DMs and posts as the user.
       authUrl.searchParams.set("user_scope", begun.scopes.join(","));
       authUrl.searchParams.set("state", `${doId}:${begun.oauthNonce}`);
       return Response.redirect(authUrl.toString(), 302);
@@ -207,11 +211,12 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
       url: "https://slack.com",
       logo: { url: SLACK_LOGO_URL },
       color: "#f4ede4",
-      tagline: "Read channels, DMs, and threads",
+      tagline: "Read and post in channels, DMs, and threads",
       description:
-          "Connect your Slack account to give Cloudflare OS read-only access to the workspaces, " +
-          "channels, direct messages, and threads you can see. Build agents that summarize " +
-          "conversations, monitor channels, or search across your Slack history.",
+          "Connect your Slack account to give Cloudflare OS access to the workspaces, channels, " +
+          "direct messages, and threads you can see. Build agents that summarize conversations, " +
+          "monitor channels, or search across your Slack history. Agents can also ask to post " +
+          "messages, thread replies, and direct messages as you; each post waits for approval.",
     };
   }
 
@@ -660,6 +665,9 @@ function messageIdToTs(messageId: string): string {
 type SlackSessionContext = {
   api: SlackApi;
   approvalQueue: RpcStub<ApprovalQueue>;
+  // Stores a post in the owning gatekeeper's storage and submits it for approval (see
+  // slack-actions.ts). A closure over that gatekeeper, so it adds nothing to the RPC surface.
+  submitPost: (queue: RpcStub<ApprovalQueue>, action: SlackPostAction) => Promise<void>;
   // Set for workspace bindings only: routes conversation-scoped observations through the gatekeeper
   // so it can record which conversations were revealed and exclude observers who cannot access them.
   // Undefined for single-unit conversation/thread bindings, whose whole resource is verified up
@@ -669,7 +677,10 @@ type SlackSessionContext = {
 };
 
 function dupSessionContext(ctx: SlackSessionContext): SlackSessionContext {
-  return { api: ctx.api, approvalQueue: ctx.approvalQueue.dup(), tracker: ctx.tracker };
+  return {
+    api: ctx.api, approvalQueue: ctx.approvalQueue.dup(), submitPost: ctx.submitPost,
+    tracker: ctx.tracker,
+  };
 }
 
 // Authorize a conversation-scoped observation. For workspace bindings this records the revealed
@@ -698,6 +709,13 @@ function conversationLabel(info: SlackConversationInfo): string {
   if (info.kind === "im") return "a direct message";
   if (info.kind === "mpim") return "a group direct message";
   return info.name ? `#${info.name}` : "a private channel";
+}
+
+// The approver-facing destination for a post. A failed lookup (a thread grant has no :read scopes,
+// for example) falls back to the bare ID rather than blocking the request.
+async function describeDestination(api: SlackApi, conversationId: string) {
+  let info = await api.getConversationInfo(conversationId).catch(() => undefined);
+  return conversationDestination(conversationId, info);
 }
 
 function conversationEntry(
@@ -770,10 +788,18 @@ class SlackCursor<T> extends RpcTarget implements Cursor<T> {
 
 // ── Gatekeeper impls ────────────────────────────────────────────────
 
+// Posts always need a person's approval: none are auto-approvable.
 const NO_ACTIONS: ActionKind[] = [];
 
-function unreachableAction(): never {
-  throw new Error("Slack gatekeeper is read-only and submits no actions.");
+// Each gatekeeper keeps its own posts in its own storage (see slack-actions.ts).
+function postSubmitter(storage: DurableObjectStorage): SlackSessionContext["submitPost"] {
+  return (queue, action) => submitSlackAction(new SlackActionStore(storage.kv), queue, action);
+}
+
+// Undoing a post would need chat.delete, which this gatekeeper doesn't use; every post is submitted
+// with implementsRevert: false, so the UI never offers this.
+function unrevertablePost(): never {
+  throw new Error("Slack posts can't be reverted automatically. Delete the message in Slack.");
 }
 
 type SlackWorkspaceGatekeeperImplProps = {
@@ -818,8 +844,10 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<SlackWorkspaceSession> {
-    return new SlackWorkspaceSessionImpl(
-        { api: this.#api(), approvalQueue: approvalQueue.dup(), tracker: this });
+    return new SlackWorkspaceSessionImpl({
+      api: this.#api(), approvalQueue: approvalQueue.dup(),
+      submitPost: postSubmitter(this.ctx.storage), tracker: this,
+    });
   }
 
   // ── Observer tracking (data-set tracking by conversation) ─────────
@@ -930,9 +958,15 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
     this.ctx.storage.kv.delete(this.#observerKey(id));
   }
 
-  applyAction(): Promise<void> { return unreachableAction(); }
-  rejectAction(): Promise<void> { return unreachableAction(); }
-  revertAction(): Promise<void> { return unreachableAction(); }
+  async applyAction(actionId: number): Promise<void> {
+    await applySlackAction(new SlackActionStore(this.ctx.storage.kv), this.#api(), actionId);
+  }
+
+  async rejectAction(actionId: number): Promise<void> {
+    rejectSlackAction(new SlackActionStore(this.ctx.storage.kv), actionId);
+  }
+
+  async revertAction(_actionId: number): Promise<void> { unrevertablePost(); }
 }
 
 type SlackConversationGatekeeperImplProps = {
@@ -979,7 +1013,8 @@ export class SlackConversationGatekeeperImpl
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<SlackConversation> {
     return new SlackConversationImpl(
-        { api: this.#api(), approvalQueue: approvalQueue.dup() },
+        { api: this.#api(), approvalQueue: approvalQueue.dup(),
+          submitPost: postSubmitter(this.ctx.storage) },
         this.ctx.props.conversationId);
   }
 
@@ -1001,9 +1036,15 @@ export class SlackConversationGatekeeperImpl
 
   async removeObserver(_id: string): Promise<void> {}
 
-  applyAction(): Promise<void> { return unreachableAction(); }
-  rejectAction(): Promise<void> { return unreachableAction(); }
-  revertAction(): Promise<void> { return unreachableAction(); }
+  async applyAction(actionId: number): Promise<void> {
+    await applySlackAction(new SlackActionStore(this.ctx.storage.kv), this.#api(), actionId);
+  }
+
+  async rejectAction(actionId: number): Promise<void> {
+    rejectSlackAction(new SlackActionStore(this.ctx.storage.kv), actionId);
+  }
+
+  async revertAction(_actionId: number): Promise<void> { unrevertablePost(); }
 }
 
 type SlackThreadGatekeeperImplProps = {
@@ -1055,7 +1096,8 @@ export class SlackThreadGatekeeperImpl extends DurableObject<Env, SlackThreadGat
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<SlackThread> {
     return new SlackThreadImpl(
-        { api: this.#api(), approvalQueue: approvalQueue.dup() },
+        { api: this.#api(), approvalQueue: approvalQueue.dup(),
+          submitPost: postSubmitter(this.ctx.storage) },
         this.ctx.props.conversationId, this.ctx.props.threadTs);
   }
 
@@ -1076,9 +1118,15 @@ export class SlackThreadGatekeeperImpl extends DurableObject<Env, SlackThreadGat
 
   async removeObserver(_id: string): Promise<void> {}
 
-  applyAction(): Promise<void> { return unreachableAction(); }
-  rejectAction(): Promise<void> { return unreachableAction(); }
-  revertAction(): Promise<void> { return unreachableAction(); }
+  async applyAction(actionId: number): Promise<void> {
+    await applySlackAction(new SlackActionStore(this.ctx.storage.kv), this.#api(), actionId);
+  }
+
+  async rejectAction(actionId: number): Promise<void> {
+    rejectSlackAction(new SlackActionStore(this.ctx.storage.kv), actionId);
+  }
+
+  async revertAction(_actionId: number): Promise<void> { unrevertablePost(); }
 }
 
 // ── Session stubs ───────────────────────────────────────────────────
@@ -1173,6 +1221,18 @@ class SlackWorkspaceSessionImpl extends RpcTarget implements SlackWorkspaceSessi
       return { items: entries, nextCursor: page.nextCursor };
     });
   }
+
+  // Whole-workspace grants only. conversations.open runs in applyAction, after approval, so no DM
+  // is opened for a request nobody approves. Unknown users fail here, before anything is queued.
+  async sendDirectMessage(userIds: string[], text: string): Promise<void> {
+    validateRecipients(userIds);
+    validatePostText(text);
+    let users = await mapWithConcurrency(userIds, id => this.#ctx.api.getUser(id));
+    await this.#ctx.submitPost(this.#ctx.approvalQueue, {
+      kind: "sendDirectMessage", userIds, text,
+      recipients: users.map(user => userLabel(user.id, user)),
+    });
+  }
 }
 
 @validateRpc()
@@ -1251,6 +1311,15 @@ class SlackConversationImpl extends RpcTarget implements SlackConversation {
       return { items: entries, nextCursor: page.nextCursor };
     });
   }
+
+  // Posts only to this conversation. The name is for the approver; the ID is what is posted to.
+  async postMessage(text: string): Promise<void> {
+    validatePostText(text);
+    await this.#ctx.submitPost(this.#ctx.approvalQueue, {
+      kind: "postMessage", conversationId: this.#conversationId, text,
+      destination: await describeDestination(this.#ctx.api, this.#conversationId),
+    });
+  }
 }
 
 @validateRpc()
@@ -1313,5 +1382,16 @@ class SlackThreadImpl extends RpcTarget implements SlackThread {
           `Read a thread of ${messages.length} messages in conversation ${this.#conversationId}.`,
     });
     return messages.slice(0, MAX_THREAD_REPLIES);
+  }
+
+  // Replies only in this thread, at its resolved root, and only once the root can be read.
+  async reply(text: string): Promise<void> {
+    validatePostText(text);
+    let { rootTs, root } = await this.#resolveRoot();
+    if (!root) throw new Error(`Thread ${this.#threadTs} not found.`);
+    await this.#ctx.submitPost(this.#ctx.approvalQueue, {
+      kind: "postMessage", conversationId: this.#conversationId, threadTs: rootTs, text,
+      destination: await describeDestination(this.#ctx.api, this.#conversationId),
+    });
   }
 }

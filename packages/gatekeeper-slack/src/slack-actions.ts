@@ -27,8 +27,6 @@ export type SlackPostAction =
     text: string;
     /** The thread root's ts, for a thread reply. */
     threadTs?: string;
-    /** A short excerpt of the thread root, shown to the approver. */
-    threadExcerpt?: string;
   }
   | {
     kind: "sendDirectMessage";
@@ -112,7 +110,8 @@ export function conversationDestination(
   return { name: conversationId, label: conversationId };
 }
 
-function validateText(text: string): void {
+/** Checks a post's text: non-empty and within Slack's limit. */
+export function validatePostText(text: string): void {
   if (typeof text !== "string" || text.trim().length === 0) {
     throw new Error("Slack message text must not be empty.");
   }
@@ -121,7 +120,8 @@ function validateText(text: string): void {
   }
 }
 
-function validateRecipients(userIds: string[]): void {
+/** Checks DM recipients: 1 to 8 distinct Slack user IDs. */
+export function validateRecipients(userIds: string[]): void {
   if (!Array.isArray(userIds) || userIds.length < 1 || userIds.length > MAX_DM_RECIPIENTS) {
     throw new Error("A direct message needs 1 to 8 recipients.");
   }
@@ -137,7 +137,7 @@ function validateRecipients(userIds: string[]): void {
 
 /** Checks a post's input, throwing before anything is stored or queued. */
 export function validateSlackAction(action: SlackPostAction): void {
-  validateText(action.text);
+  validatePostText(action.text);
   if (action.kind === "sendDirectMessage") validateRecipients(action.userIds);
 }
 
@@ -168,8 +168,9 @@ export function describeSlackAction(action: SlackPostAction): ActionDescription 
     title = `Reply in a thread in ${action.destination.name}`;
     lines = [
       `**Destination:** ${action.destination.label}`,
-      `**Thread:** a reply to the message sent at \`${action.threadTs}\`` +
-          (action.threadExcerpt ? `, which begins:\n\n${fenced(action.threadExcerpt)}` : "."),
+      // No excerpt of the root: the action log is visible to collaborators who may not be able to
+      // read this conversation, so the description carries no content beyond the post itself.
+      `**Thread:** a reply to the message sent at \`${action.threadTs}\`.`,
     ];
   } else {
     title = `Post to ${action.destination.name}`;
