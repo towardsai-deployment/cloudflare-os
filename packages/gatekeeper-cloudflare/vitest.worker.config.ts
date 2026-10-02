@@ -15,8 +15,10 @@ export default defineConfig({
       main: "./__tests__/worker.ts",
       miniflare: {
         // Kept in step with wrangler.jsonc; a drift here tests a runtime we do not deploy.
-        compatibilityDate: "2026-02-02",
+        compatibilityDate: "2026-09-04",
         compatibilityFlags: ["allow_irrevocable_stub_storage", "nodejs_als"],
+        // `UserAccount` refuses to refresh without client credentials; the provider itself is stubbed.
+        bindings: { CLIENT_ID: "client", CLIENT_SECRET: "secret" },
         durableObjects: {
           USER_ACCOUNT: { className: "UserAccount", useSQLite: true },
           OBSERVABILITY_GATEKEEPER: {
@@ -34,6 +36,6 @@ export default defineConfig({
   test: {
     include: ["__tests__/workerd/*.test.ts"],
     // Asserts the pool actually started, rather than trusting a green run to mean workerd.
-    setupFiles: ["../../scripts/assert-workerd.ts"],
+    setupFiles: ["@gadgets/scripts/assert-workerd"],
   },
 });

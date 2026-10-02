@@ -36,6 +36,11 @@ export const ADMIN_USERNAME = "admin";
 const WORKER_CONFIG = z.looseObject({
   name: z.string(),
   main: z.string(),
+  account_id: z.string().optional(),
+  ai: z.looseObject({
+    binding: z.string(),
+    remote: z.boolean().optional(),
+  }).optional(),
   build: z.looseObject({ command: z.string().optional(), cwd: z.string().optional() }).optional(),
   services: z.array(z.looseObject({
     binding: z.string(),
@@ -76,13 +81,23 @@ function readWorkerConfig(dir: string): WorkerConfig {
   const config = parsed.data;
   config.build = { ...config.build, cwd: dir };
   config.main = join(dir, config.main);
+
+  // Local-dev var files (.dev.vars/.env at the harness root) must not leak into tests: a
+  // developer's local settings (say CF_AI_GATEWAY_*) would make suites behave differently on
+  // their machine than in CI -- up to sending real AI traffic. Declaring an empty required-secrets
+  // list makes wrangler exclude every such key that is not already a config var.
+  config.secrets = { required: [] };
   return config;
 }
 
 function workshopConfig(
     gatekeepers: { binding: string; name: string }[],
+    enableGadgetExecution: boolean,
     patch?: (config: WorkerConfig) => void): WorkerConfig {
   const config = readWorkerConfig(WORKSHOP_DIR);
+  // globalSetup completed the destructive shared `.wrangler/validate` build before file workers
+  // started. Rebuilding it in each fork would race on that directory.
+  if (process.env.WORKSHOP_INTEGRATION_PREBUILT === "1") delete config.build;
 
   // The checked-in config declares no services; run-dev-server.ts adds one per gatekeeper. We add
   // only the ones the suite asked for, so buildGatekeeperVendorMap() discovers exactly those vendors
@@ -94,11 +109,12 @@ function workshopConfig(
   }));
 
   // No CF_ACCESS_AUD, so /api takes the unauthenticated path and password signup is available.
-  config.vars = { ...config.vars, ADMINS: [ADMIN_USERNAME] };
+  // PUBLIC_BASE_URL mirrors run-dev-server.ts; only connect handoffs read it, as their target origin.
+  config.vars = { ...config.vars, ADMINS: [ADMIN_USERNAME], PUBLIC_BASE_URL: "http://workshop.test" };
 
-  // Gadget code is never executed here (a gatekeeper is in observer scope purely by having a
-  // vendorId), so drop the Worker Loader rather than requiring it to start.
-  delete config.worker_loaders;
+  // Most integration tests need no Gadget execution. Keep the loader only for tests that exercise
+  // executeCode or a generated Gadget server.
+  if (!enableGadgetExecution) delete config.worker_loaders;
 
   patch?.(config);
   return config;
@@ -124,6 +140,7 @@ export type Harness = {
 export async function startHarness(opts: {
   gatekeepers: GatekeeperSpec[];
   patchWorkshop?: (config: WorkerConfig) => void;
+  enableGadgetExecution?: boolean;
   /** Defaults to this repo's root. Override when a gatekeeper lives outside it. */
   root?: string;
 }): Promise<Harness> {
@@ -139,7 +156,8 @@ export async function startHarness(opts: {
     root: opts.root ?? REPO_ROOT,
     // workshop-backend is primary, so unrouted requests (e.g. /api) go to it.
     workers: [
-      { config: workshopConfig(gatekeepers, opts.patchWorkshop) },
+      { config: workshopConfig(gatekeepers, opts.enableGadgetExecution ?? false,
+          opts.patchWorkshop) },
       ...gatekeepers.map(({ config }) => ({ config })),
     ],
   });
@@ -152,9 +170,28 @@ export async function startHarness(opts: {
   };
 }
 
+/**
+ * How long to wait for a scheduled workspace restart to land (scheduleAccessRestart's delay plus
+ * slack). See settleRestart().
+ */
+export const RESTART_SETTLE_MS = 400;
+
+/**
+ * Give a scheduled workspace restart time to land.
+ *
+ * Widening a collaborator's verification scope severs every session on the workspace by aborting
+ * the DO ~100ms later. A test that asserts a change did not restart the workspace waits this long
+ * first, so a wrongful restart lands before its assertions rather than after the test.
+ */
+export function settleRestart(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, RESTART_SETTLE_MS));
+}
+
 /** Boot the Workshop with only the bundled fixture gatekeeper bound. */
-export function startTestGatekeeperHarness(): Promise<Harness> {
+export function startTestGatekeeperHarness(options: { enableGadgetExecution?: boolean } = {})
+    : Promise<Harness> {
   return startHarness({
     gatekeepers: [{ binding: TEST_GATEKEEPER_BINDING, dir: TEST_GATEKEEPER_DIR }],
+    enableGadgetExecution: options.enableGadgetExecution,
   });
 }

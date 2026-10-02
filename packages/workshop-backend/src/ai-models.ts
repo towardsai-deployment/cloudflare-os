@@ -4,6 +4,7 @@ import type {
   AnthropicMessagesCompat, Api, AssistantMessageEventStream, Context, FetchFunction, Model,
   ModelCost, OpenAICompletionsCompat, ProviderHeaders, SimpleStreamOptions, StreamFunction,
 } from "@earendil-works/pi-ai";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import { stream as anthropicMessagesStream } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { stream as googleGenerativeAiStream } from "@earendil-works/pi-ai/api/google-generative-ai";
 import { stream as openaiCompletionsStream } from "@earendil-works/pi-ai/api/openai-completions";
@@ -18,6 +19,7 @@ import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
 import {
   AiChatAuthorInfo, AiModelConfig, OpenModelConfig, SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT,
 } from "@gadgets/workshop-shared/api";
+import { traceChat } from "./agent-tracing.js";
 import { AiGatewayConfig, getAiGatewayConfig, type AiGatewayLogRoute } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
@@ -139,15 +141,16 @@ function catalogModel(provider: AiModelConfig["provider"], modelId: string): Mod
   }
 }
 
-// Token limits for a synthesized model. SUGGESTED_MODELS remains authoritative (compaction
-// budgets in agent-compaction.ts are computed from it and must not change); pi's catalog fills
-// gaps for models we don't list, and unknown models get conservative defaults.
+// Token limits for a synthesized model. The model config's own overrides come first, then
+// SUGGESTED_MODELS (compaction budgets in agent-compaction.ts are computed from the same two); pi's
+// catalog fills gaps for models we don't list, and unknown models get conservative defaults.
 function modelTokenWindow(config: AiModelConfig, catalog: Model<Api> | undefined)
     : { contextWindow: number, maxTokens: number } {
   const suggested = SUGGESTED_MODELS[config.provider]?.[config.model];
   return {
-    contextWindow: suggested?.contextWindow ?? catalog?.contextWindow ?? 128_000,
-    maxTokens: suggested?.outputLimit ??
+    contextWindow: config.contextWindow ?? suggested?.contextWindow ?? catalog?.contextWindow ??
+        128_000,
+    maxTokens: config.outputLimit ?? suggested?.outputLimit ??
         (config.provider === "cloudflare" ? WORKERS_AI_OUTPUT_LIMIT : undefined) ??
         catalog?.maxTokens ?? 4096,
   };
@@ -357,6 +360,9 @@ function makeHandle(args: HandleArgs): ModelHandle {
     stream: (model, context, { thinking = true, ...options } = {}) => {
       // Never let a failed request read a previous request's response metadata.
       handle.lastResponse = undefined;
+      // This request's own response metadata: concurrent requests on one handle overwrite
+      // `lastResponse`, but not this.
+      let received: ModelHandle["lastResponse"];
       const headers: ProviderHeaders = {
         ...args.headers,
         ...options.headers,
@@ -366,13 +372,16 @@ function makeHandle(args: HandleArgs): ModelHandle {
       };
       const merged: SimpleStreamOptions = {
         // API defaults first, so an explicit per-call option can override them. `thinking: false`
-        // replaces them with an explicit thinking-off request: for Anthropic pi sends
-        // `thinking: {type:"disabled"}` (and knows to omit it for models that can't turn thinking
-        // off, e.g. claude-fable-5); for OpenAI Responses, passing no reasoningEffort makes pi
-        // disable reasoning.
+        // replaces them with a quick request. Managed-effort Anthropic models must use adaptive
+        // thinking, so select their lowest effort; other Anthropic models disable it (or omit
+        // the unsupported off setting). For OpenAI Responses, passing no reasoningEffort disables
+        // reasoning.
         ...(thinking
             ? apiExtras
-            : args.model.api === "anthropic-messages" ? { thinkingEnabled: false } : {}),
+            : args.model.api === "anthropic-messages"
+                ? (anthropicCompat?.supportsMidConvoEffort === true
+                    ? { effort: "low" } : { thinkingEnabled: false })
+                : {}),
         ...(args.fetch !== undefined ? { fetch: args.fetch } : {}),
         ...options,
         // Open models have no SUGGESTED_MODELS entry, so callers (agent-compaction's token
@@ -386,10 +395,11 @@ function makeHandle(args: HandleArgs): ModelHandle {
         // Session affinity: pi only sends it when caching isn't "none" (fine for us).
         sessionId: options.sessionId ?? args.sessionAffinity,
         onResponse: async (response, responseModel) => {
-          handle.lastResponse = {
+          received = {
             status: response.status,
             aiGatewayLogId: getHeader(response.headers, "cf-aig-log-id"),
           };
+          handle.lastResponse = received;
           await options.onResponse?.(response, responseModel);
         },
         // PDF attachments ride pi image parts and are rewritten here into the provider's native
@@ -399,7 +409,8 @@ function makeHandle(args: HandleArgs): ModelHandle {
           return bridgePdfAttachments(args.model.api, replaced ?? payload) ?? replaced;
         },
       };
-      return streamFn(model, context, merged);
+      return traceChat(model, () => received,
+          () => streamFn(model, normalizeContext(context), merged));
     },
   };
   return handle;
@@ -426,7 +437,7 @@ export function getModel(env: Cloudflare.Env, config: AiModelConfig,
   }
 
   // Otherwise: when a platform AI Gateway is configured, route through it (platform-funded free
-  // tier). The config's apiToken/apiUrl are ignored in that mode.
+  // tier). The config's apiToken/apiUrl/extraHeaders are ignored in that mode.
   let gwConfig = getAiGatewayConfig(env);
   if (gwConfig) {
     return getModelViaGateway(gwConfig, config, initiator, options);
@@ -565,6 +576,17 @@ function getModelViaGateway(
   });
 }
 
+// Auth for a direct connection whose client can omit the API key, which `keyHeader` carries. A
+// blank token sends no key at all: local Ollama needs none, and a proxy may authenticate through
+// the config's extraHeaders instead (AI Gateway only injects its stored provider key into requests
+// that don't already carry one). The SDKs insist on *some* key, so they get a placeholder, while a
+// null default header deletes the header they derive from it; extra headers still override.
+function directAuth(config: AiModelConfig, keyHeader: string): Pick<HandleArgs, "apiKey" | "headers"> {
+  return config.apiToken === ""
+      ? { apiKey: "unused", headers: { [keyHeader]: null, ...config.extraHeaders } }
+      : { apiKey: config.apiToken, headers: config.extraHeaders };
+}
+
 // Direct provider access using the credentials in the model config itself (no AI Gateway).
 function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelHandle {
   const catalog = catalogModel(config.provider, config.model);
@@ -586,7 +608,7 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
           // Catalog compat verbatim -- see the gateway-path comment on forceAdaptiveThinking.
           compat: catalog?.compat,
         },
-        apiKey: config.apiToken,
+        ...directAuth(config, "x-api-key"),
         sessionAffinity,
       });
     case "cloudflare": {
@@ -612,6 +634,7 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
           compat: workersAiCompat(catalog),
         },
         apiKey: config.apiToken,
+        headers: config.extraHeaders,
         sessionAffinity,
       });
     }
@@ -629,7 +652,10 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
           ...window,
           thinkingLevelMap: catalog?.thinkingLevelMap,
         },
+        // Not directAuth: pi's Google API requires a key, and @google/genai adds `x-goog-api-key`
+        // with no way to suppress it (an extra header of that name replaces it, though).
         apiKey: config.apiToken,
+        headers: config.extraHeaders,
         sessionAffinity,
       });
     case "ollama":
@@ -638,9 +664,7 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
       // the native-API base `http://host:11434/api` (the old ollama provider's convention), and
       // users may paste the /v1 endpoint directly. When no API key was configured we assume
       // local auth and send no Authorization header at all (as before the pi migration; a strict
-      // local proxy may reject an unexpected bearer token): the OpenAI SDK requires *some* key,
-      // so give it a placeholder while a null default header deletes the Authorization header
-      // the SDK derives from it.
+      // local proxy may reject an unexpected bearer token).
       return makeHandle({
         model: {
           id: config.model,
@@ -677,9 +701,7 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
 
           ...window,
         },
-        ...(config.apiToken === ""
-            ? { apiKey: "unused", headers: { Authorization: null } }
-            : { apiKey: config.apiToken }),
+        ...directAuth(config, "Authorization"),
         sessionAffinity,
       });
     case "openai":
@@ -697,7 +719,7 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
           thinkingLevelMap: catalog?.thinkingLevelMap,
           compat: catalog?.compat,
         },
-        apiKey: config.apiToken,
+        ...directAuth(config, "Authorization"),
         sessionAffinity,
       });
     case "gateway-openai":
