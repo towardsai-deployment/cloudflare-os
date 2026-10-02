@@ -8,6 +8,7 @@ import {
   Gatekeeper,
   ResourceDescription,
   ApprovalQueue,
+  ActionKind,
   ObservationDescription,
   VendorDescription,
   GatekeeperConnectCallback,
@@ -968,6 +969,19 @@ type StoredActionDraft = StoredAction extends infer T
 // supplied is shown in full and the completeness claim is the builder's, never hand-set.
 type ActionDescriptionDraft = { title: string; implementsRevert: boolean } & RenderedDescription;
 
+// Every Linear write may auto-apply once a user enables "Always approve" for its kind on the
+// connection. None deletes anything: archive is undone by unarchive, and the rest are revertible
+// edits or new content. Label add and remove share a tag so one rule governs label changes.
+const ACTION_KINDS: Record<StoredAction["kind"], ActionKind> = {
+  createIssue: { tag: "createIssue", label: "Create issues" },
+  updateIssue: { tag: "updateIssue", label: "Edit issue fields" },
+  addLabels: { tag: "changeLabels", label: "Add or remove issue labels" },
+  removeLabels: { tag: "changeLabels", label: "Add or remove issue labels" },
+  postComment: { tag: "postComment", label: "Post comments" },
+  createLabel: { tag: "createLabel", label: "Create labels" },
+  archive: { tag: "archive", label: "Archive or unarchive issues" },
+};
+
 type LinearGatekeeperImplProps = {
   userObjectId: string;
   workspaceUrlKey: string;
@@ -1146,7 +1160,9 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
     this.ctx.storage.kv.put<StoredAction>(`action:${id}`, { ...action, id, status: "pending" } as StoredAction);
     this.#invalidatePendingActions();
     try {
-      await approvalQueue.submitAction(id, description);
+      await approvalQueue.submitAction(id, {
+        ...description, autoApprovable: true, actionKind: ACTION_KINDS[action.kind],
+      });
     } catch (err) {
       // An auto-approval can apply the action mid-flight, which proves the overseer received it --
       // only the reply was lost, and reporting failure would invite a repeated provider write. A
@@ -1485,7 +1501,8 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
   }
 
   async getAutoApprovableActions() {
-    return [];
+    // Distinct by tag: label add and remove share one.
+    return [...new Map(Object.values(ACTION_KINDS).map(kind => [kind.tag, kind])).values()];
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<LinearWorkspace | LinearTeam | LinearIssue> {
